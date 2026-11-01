@@ -1,0 +1,294 @@
+# Helix
+
+**A local coding assistant that runs entirely on your own PC.** Helix chats with a local LLM through [Ollama](https://ollama.com), writes and edits code, and can **build its own plugins**: it writes a tool plus a unit test, runs the test in an isolated process, and only mounts the tool if the test passes. It also ships a complete pipeline for fine-tuning the model on your own machine.
+
+- **Private by design**: no cloud API, no telemetry. Everything runs against your local Ollama.
+- **Self-extending, but contained**: the AI can only write inside `plugins/custom_tools/`, `plugins/tests/` and `workspace/`. It cannot modify Helix itself.
+- **Plain Python and Windows `.bat` launchers**: nothing to compile, one tiny dependency (`ollama`).
+- **GPU-aware**: switch between "max speed" and "leave VRAM for other apps" with a chat command.
+
+> **Platform:** Windows 10/11 (the launchers are `.bat` files). The Python code itself is portable, but only Windows has been tested.
+> **Status:** the chat engine, plugin builder and data pipeline are tested and working. The fine-tuning step has **not** been run end to end yet (see [Training](#training-optional)).
+
+---
+
+## Requirements
+
+| What | Why |
+|---|---|
+| **Windows 10/11** | the `.bat` launchers |
+| **Python 3.12** (64-bit, with the `py` launcher) | runs Helix; the launchers create their own virtual environment |
+| **[Ollama](https://ollama.com/download)** | serves the model |
+| **~10 GB free disk** + RAM/VRAM for the model | `qwen2.5-coder:14b` is a ~9 GB download |
+| NVIDIA GPU with ~10-12 GB VRAM *(recommended)* | without one Helix still works but is slow (see [GPU memory](#gpu-memory-control-vram)) |
+
+## Quick start
+
+```bat
+:: 1. Get the model (once)
+ollama pull qwen2.5-coder:14b
+
+:: 2. Get Helix
+git clone https://github.com/beckers0347/Helix.git
+cd Helix
+
+:: 3. Run it (the first run creates .venv and installs the one dependency)
+run_helix.bat
+```
+
+You should see a banner and a `Helix >` prompt. Ask something, or try `/vram status`. The **first reply after starting is slow** (30-40 seconds) because Ollama has to load the model into memory; later replies are fast.
+
+If Ollama isn't running, Helix tells you in plain English and exits.
+
+---
+
+## Using Helix
+
+### Interactive chat
+
+```bat
+run_helix.bat
+```
+
+Type a request and press Enter. Type `exit` or `quit` to leave. `Ctrl+C` cancels the current turn.
+
+### Command-line options
+
+| Option | What it does |
+|---|---|
+| `--once "prompt"` | run a single turn, print the answer, exit |
+| `--build-plugin "description"` | have the model write, test and mount a plugin (see below) |
+| `--model NAME` | use another Ollama model (default `qwen2.5-coder:14b`) |
+| `--no-tools` | plain chat, no tool execution |
+| `--vram max\|shared\|cpu` | starting GPU profile (default `shared`) |
+| `--unload` | unload the model from Ollama (free GPU memory) and exit |
+
+Examples:
+
+```bat
+run_helix.bat --once "Explain how Python imports work"
+run_helix.bat --build-plugin "Calculates the CRC32 checksum of a file"
+run_helix.bat --vram max
+run_helix.bat --unload
+```
+
+### What Helix can do in a chat turn
+
+Helix gives the model a small set of tools and runs the tool calls it makes: read files, **write new files**, **replace text in existing files** (exact match), check Python syntax, run a Python test in an isolated process, create plugins and list them. Tool calls work both when the model returns them natively and when a smaller model prints them as text (fenced JSON, bare JSON, `<tool_call>` blocks, arguments given as a JSON string, ...).
+
+Writes are limited to the three safe folders (see [Safety](#safety-model)).
+
+---
+
+## GPU memory control (`/vram`)
+
+Large models and creative software compete for VRAM. Helix lets you choose how many of the model's layers live on the GPU, **while chatting**:
+
+| Command | Layers on GPU | What it means |
+|---|---|---|
+| `/vram max` | all | fastest; uses ~10 GB of VRAM |
+| `/vram shared` | 24 of 48 | **default**; about half the speed, leaves ~5-6 GB free for other apps (Unreal, Blender, CAD, ...) |
+| `/vram cpu` | 0 | no GPU at all; slowest, uses no VRAM |
+| `/vram free` | - | unload the model **now** and free its GPU memory |
+| `/vram status` | - | show the profile, `keep_alive` and what Ollama currently holds |
+
+Switching profile unloads the model immediately (Ollama has to reload it with the new split anyway), so **the next reply takes ~40 seconds**. Switching to the profile you're already on changes nothing.
+
+Rough numbers measured on an RTX 5070 (12 GB) with `qwen2.5-coder:14b`: all layers ~20-35 tokens/s, 24 layers ~8 tokens/s, CPU only ~4 tokens/s. Your numbers will differ.
+
+Idle models are released after **2 minutes** (`keep_alive`), and Helix unloads the model when it exits.
+
+> `MAX_PERFORMANCE` sends `num_gpu=99` ("every layer"), not 48. The model has 48 transformer blocks plus an output layer, and `num_gpu=48` leaves the output layer on the CPU, which was measured ~40% slower.
+
+---
+
+## Building plugins
+
+A plugin is one Python class that inherits `BaseTool`, plus a unit test.
+
+```bat
+run_helix.bat --build-plugin "Computes the SHA-256 hash of a string"
+```
+
+What happens:
+
+1. The model is prompted with a strict template and must return exactly two fenced Python blocks: the tool and its test.
+2. Helix checks the code (AST validation: no placeholders, stubs or `pass`-only methods).
+3. The files are written to `plugins/custom_tools/` and `plugins/tests/`.
+4. The test runs in a **separate process** (UTF-8, with a timeout). If it fails, the traceback is fed back to the model and it retries (up to 3 attempts in the harness).
+5. If it passes, the plugin is hot-loaded and recorded in `plugins/registry.json`.
+
+**Check it works on your machine:**
+
+```bat
+test_plugin_builder.bat
+```
+
+This asks the model to build a `StringHasherTool`, then verifies the *mounted* tool itself against `hashlib` on `"hello"`, the empty string and a non-ASCII string, and cleans up after itself. Generating the code can take a few minutes the first time.
+
+### The plugin contract
+
+```python
+from helix_core.base_tool import BaseTool, ToolResult
+
+class EchoTool(BaseTool):
+    name = "echo_tool"
+    version = "1.0.0"
+    description = "Returns the text it was given."
+    parameters_schema = {
+        "type": "object",
+        "properties": {"text": {"type": "string", "description": "Text to echo."}},
+        "required": ["text"],
+    }
+
+    def execute(self, **kwargs):
+        text = kwargs.get("text")
+        if text is None:                      # an empty string is a valid value: test for None, not truthiness
+            return ToolResult.error("Missing required parameter: text")
+        return ToolResult.success(output=text)
+```
+
+Save it as `plugins/custom_tools/echo_tool.py` and put a plain-Python test in `plugins/tests/test_echo_tool.py` (it must exit 0 on success; it puts the Helix root on `sys.path` itself, no pytest needed). Helix discovers tools on start-up.
+
+`plugins/registry.json` starts as `{}`. Helix only rewrites it when a plugin is created, updated, disabled or quarantined. A registry it cannot read is **backed up** as `registry.json.corrupt-<time>`, never silently discarded.
+
+---
+
+## Configuration
+
+All optional. Set them as environment variables before running `run_helix.bat`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HELIX_MODEL` | `qwen2.5-coder:14b` | Ollama model name |
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | where Ollama listens |
+| `HELIX_VRAM_PROFILE` | `shared` | `max`, `shared` or `cpu` at start-up |
+| `HELIX_NUM_GPU` | - | custom layer count (`12`), or `auto` to let Ollama decide; overrides the profile |
+| `HELIX_KEEP_ALIVE` | `2m` | how long an idle model stays loaded |
+| `HELIX_UNLOAD_ON_EXIT` | `1` | set `0` to keep the model loaded after Helix exits |
+
+Fixed generation settings (in `helix_core/config.py`): temperature 0.1, top_p 0.95, context 8192 tokens, stop token `<|im_end|>`. They are passed on **every** model call.
+
+---
+
+## Training (optional)
+
+`training/` contains a local fine-tuning pipeline (DPO, 4-bit LoRA) for Qwen coder models. **You do not need it to use Helix.**
+
+> **Honest status:** the data pipeline is tested and was run on the full datasets. The trainer's logic, argument handling and `--dry-run` are tested offline, but **no real training run has been completed yet**, and Unsloth on Windows is unverified. Treat it as a starting point.
+
+### 1. Prepare the dataset
+
+```bat
+training\run_data_prep.bat
+```
+
+Downloads preference datasets, cleans and filters them, and writes `training/data/merged_dpo_dataset.jsonl` (plus a stats file). It needs only the Python standard library (no `datasets` package), is **resumable** (re-run it and it continues), and copes with Hugging Face rate limits (HTTP 429) by waiting and retrying. A full run took ~16 minutes and produced ~60,000 pairs.
+
+| Source | Kind |
+|---|---|
+| `Vezora/Code-Preference-Pairs` | coding (original pairs) |
+| `jondurbin/py-dpo-v0.1` | Python coding |
+| `CyberNative/Code_Vulnerability_Security_DPO` | secure vs. vulnerable code |
+| `HuggingFaceH4/ultrafeedback_binarized` | general chat |
+| `argilla/dpo-mix-7k` | general chat |
+| `voxozi/agentforge-multiturn-toolcall` | tool calling (**synthetic** pairs, see below) |
+| `lvwerra/stack-exchange-paired` | only if the `datasets` package is installed |
+
+Notes:
+- `kashif/StackExchange_Code_DPO` is listed in the registry but **does not exist on Hugging Face**; the coding sources above replace it. A missing source is skipped with a warning.
+- The agentforge dataset has no "rejected" answers, so Helix builds them deterministically by corrupting the real tool call (wrong tool, dropped required argument, claiming success without calling the tool, ignoring a real tool error). These are marked `pair_type: synthetic`.
+- Prompts are rendered in Qwen's chat format (with the tool definitions for tool pairs), because DPO only makes sense on prompts that look like what the model sees at inference.
+- **Check each dataset's license** before you train on it or redistribute anything derived from it. No data is included in this repository.
+
+Useful options: `--list-sources`, `--sources vezora,ultrafeedback`, `--max-per-source 2000` (a small test run), `--max-chars`, `--selftest`, `--verify`, `--offline`, `--refresh`.
+
+### 2. Fine-tune (needs an NVIDIA GPU)
+
+```bat
+training\run_fine_tune.bat --dry-run      :: validates everything, touches no GPU
+training\run_fine_tune.bat --max-steps 20 :: short smoke test first
+training\run_fine_tune.bat                :: the real run
+```
+
+- Uses its **own** virtual environment (`.venv-train`) and `training/requirements-train.txt` (Unsloth, TRL, PyTorch, ...). Read the notes at the top of that file: new NVIDIA cards (RTX 50-series) need a PyTorch build with CUDA 12.8+.
+- Needs ~11 GB of **free** VRAM for the 14B model: close Ollama, Blender, Unreal and other GPU programs first. `--model-size 32b` is refused unless you pass `--force`.
+- Tool-calling pairs are long (their prompts include the tool definitions), so at the default `--max-seq-length 1024` most of them are filtered out and the trainer says so. Raise `--max-seq-length` / `--max-prompt-length` if your GPU allows.
+- The LoRA adapter is saved **before** the 16-bit GGUF export (~30 GB for the 14B model; the script checks free disk first). `--skip-gguf` trains and saves the adapter only.
+
+### 3. Use the result in Helix
+
+The trainer writes a `Modelfile` next to the exported GGUF. A 16-bit GGUF is too big for a 12 GB GPU, so quantize it first with llama.cpp, then register it with Ollama:
+
+```bat
+llama-quantize.exe model-f16.gguf model-Q4_K_M.gguf Q4_K_M
+ollama create helix-coder -f Modelfile
+set HELIX_MODEL=helix-coder
+run_helix.bat
+```
+
+(Edit the `FROM` line in the `Modelfile` to point at the quantized file.) The trainer prints the exact commands when it finishes.
+
+---
+
+## Tests
+
+All offline: no network, no model, no GPU, no pytest. The standard library is enough.
+
+```bat
+py -3.12 tests\run_all.py
+```
+
+| Suite | Covers |
+|---|---|
+| `tests/test_helix_core.py` (14) | tool-call parser, security guard, plugin lifecycle and registry safety, engine loop, code tools, UTF-8 subprocess output, `/vram` and GPU profiles |
+| `tests/test_training_data.py` (21) | dataset mappers, synthetic pairs, cleaning/filters, resumable downloads, verification |
+| `tests/test_training_trainer.py` (36) | prompt rendering, TRL-version compatibility, CLI, dataset reader, dry-run |
+
+## Safety model
+
+- **Writes are confined.** The security guard resolves every path (`..`, symlinks, case, network shares, look-alike folder names) and allows AI writes only under `plugins/custom_tools/`, `plugins/tests/` and `workspace/`. Helix's own code (`helix_core/`), `main.py`, the launchers, `training/` and `registry.json` are off limits to the AI.
+- **Plugins run with your user's permissions.** A plugin is Python code that executes on your machine. Helix validates and tests it before mounting, but a test cannot prove that code is harmless. Read plugins before you trust them, and don't paste prompts from sources you don't trust.
+- **Local only.** The only network use is talking to your Ollama server and, if you run the data pipeline, downloading datasets from Hugging Face.
+
+## Project layout
+
+```
+Helix/
+├── run_helix.bat            launcher: chat + code engine
+├── test_plugin_builder.bat  launcher: end-to-end plugin builder test
+├── main.py                  CLI entry point and chat loop
+├── requirements.txt         runtime dependencies (ollama)
+├── test_harness.py          the plugin-builder test
+├── helix_core/              engine
+│   ├── config.py            model options, prompts, VRAM profiles
+│   ├── engine.py            Ollama client, chat loop, /vram commands
+│   ├── toolcalls.py         pure text tool-call parser
+│   ├── codetools.py         read / write / replace / syntax-check tools
+│   ├── plugin_manager.py    validate, test, hot-load, registry, quarantine
+│   ├── security.py          path guard
+│   ├── base_tool.py         BaseTool and ToolResult
+│   └── paths.py             location-independent paths
+├── plugins/                 custom_tools/, tests/, registry.json
+├── workspace/               scratch area the AI may write to
+├── training/                data prep, DPO trainer, launchers, data/ (git-ignored)
+└── tests/                   offline test suites
+```
+
+Every path Helix uses is resolved relative to its own folder, so you can clone or move it anywhere.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| "Cannot connect to Ollama" | start Ollama (`ollama serve`, or open the Ollama app) |
+| First reply takes 30-40 s | normal: the model is loading. After 2 idle minutes it unloads and the next reply pays this cost again (`HELIX_KEEP_ALIVE=10m` keeps it longer) |
+| Replies are slow | you're probably on `/vram shared` or `cpu`: try `/vram max` when no other GPU program is running |
+| The GPU runs out of memory | `/vram shared` or `/vram free`; close other GPU programs |
+| `py` is not recognised | install Python 3.12 from python.org with the "py launcher" option |
+| The launcher won't start in a folder with spaces | it quotes paths and works in folders like `C:\Users\Jane Doe\Helix`; if it fails, re-download and check antivirus quarantine |
+| The plugin builder gives up | try again (small models are not always right the first time), or write the plugin yourself using the contract above |
+
+## License
+
+No license has been chosen yet, so by default **all rights are reserved**: you can read the code, but you are not granted permission to reuse or redistribute it. If you'd like to use Helix in your own project, please open an issue.

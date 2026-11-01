@@ -1,0 +1,28 @@
+# Helix DPO Fine-Tuning Dependencies
+# Target Hardware: NVIDIA GeForce RTX 5070 (12 GB VRAM, Blackwell sm_120), Windows 10/11
+# Python: 3.12 64-bit with CUDA 12.8
+#
+# Workstation Installation Notes:
+# -----------------------------------------------------------------------------
+# 1. NVIDIA RTX 5070 (Blackwell sm_120):
+#    Blackwell architecture requires CUDA 12.8+ and PyTorch builds with sm_120 support.
+#    Standard stable PyTorch (cu124) will emit arch compatibility warnings or fail kernel execution.
+#    Install PyTorch with CUDA 12.8 using:
+#      pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+#
+# 2. Windows C++ Toolchain & Triton:
+#    Unsloth requires Triton kernels. On Windows, Triton is supported via Windows Triton wheels
+#    (e.g., https://github.com/woct0rdho/triton-windows/releases) or within WSL2.
+#
+# 3. BitsAndBytes for Windows:
+#    Native Windows support is available in bitsandbytes>=0.43.0.
+# -----------------------------------------------------------------------------
+
+torch>=2.5.0
+transformers>=4.46.0
+datasets>=3.0.0
+accelerate>=1.0.0
+peft>=0.13.0
+trl>=0.12.0
+bitsandbytes>=0.43.0
+unsloth>=2024.10

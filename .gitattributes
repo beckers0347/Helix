@@ -1,2 +1,12 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Windows batch files must keep CRLF line endings or cmd.exe can misparse them
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Everything else is checked out with LF so the code is identical on every platform
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf

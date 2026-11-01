@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments created by the launchers
+.venv/
+.venv-train/
+
+# Local state and secrets (never commit)
+.env
+.env.*
+*.log
+registry.json.corrupt-*
+*.tmp
+
+# Downloaded datasets, caches, trained weights and model exports (large, regenerable, may carry their own licenses)
+training/data/raw/
+training/data/tokenized/
+training/data/exports/
+training/data/_smoke/
+training/data/*.jsonl
+training/data/*.stats.json
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.bin
+
+# Plugins the AI/user builds locally stay local; only the folders are tracked
+plugins/custom_tools/*
+!plugins/custom_tools/.gitkeep
+plugins/tests/*
+!plugins/tests/.gitkeep
+plugins/quarantine/
+workspace/*
+!workspace/.gitkeep
+
+# OS / editor
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
