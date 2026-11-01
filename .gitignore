@@ -43,3 +43,6 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+
+# Per-machine hardware profile written by the startup auto-tuner
+config/

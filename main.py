@@ -7,7 +7,8 @@ import os
 import re
 import sys
 
-from helix_core.config import MODEL_NAME, PLUGIN_BUILDER_PROMPT
+from helix_core import autotune
+from helix_core.config import MODEL_NAME, OLLAMA_HOST, PLUGIN_BUILDER_PROMPT
 from helix_core.config import set_vram_profile
 from helix_core.engine import CoreEngine, OllamaClient, handle_vram_command, unload_model
 from helix_core.paths import init_user_workspace
@@ -35,14 +36,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Helix Autonomous Coding Assistant")
     parser.add_argument("--once", type=str, help="Execute a single turn and exit.")
     parser.add_argument("--build-plugin", type=str, help="Prompt the model to build, verify, and mount a plugin.")
-    parser.add_argument("--model", type=str, default=MODEL_NAME, help="Ollama model to use.")
+    parser.add_argument("--model", type=str, default=None, help=f"Ollama model to use (default: {MODEL_NAME}).")
     parser.add_argument("--no-tools", action="store_true", help="Disable tool execution.")
     parser.add_argument("--unload", action="store_true",
                         help="Unload the model from Ollama (free its GPU memory) and exit.")
     parser.add_argument("--vram", type=str, default=None, metavar="PROFILE",
-                        help="Start with a VRAM profile: max | shared | cpu (default: shared). Change it in chat with /vram.")
+                        help="Start with a fixed VRAM profile: max | shared | cpu (skips hardware auto-tuning). Change it in chat with /vram.")
+    autotune.add_arguments(parser)
 
     args = parser.parse_args()
+    args.model_explicit = args.model            # only a model typed on the command line is exempt from the 'does it fit' check
+    args.model = args.model or MODEL_NAME
 
     # --unload must work even when nothing else can: handle it before any connection check or workspace setup.
     if args.unload:
@@ -50,12 +54,20 @@ def main() -> None:
         print(f"[{'OK' if result['unloaded'] else 'WARN'}] {result['detail']}")
         sys.exit(0)
 
+    if args.hardware_info:
+        sys.exit(autotune.hardware_info(args, args.model, OLLAMA_HOST))
+
     if args.vram:
         ok, _changed, profile, num_gpu = set_vram_profile(args.vram)
         if not ok:
             print(f"[ERROR] Unknown --vram profile '{args.vram}'. Use max, shared or cpu.", file=sys.stderr)
             sys.exit(2)
         print(f"[*] VRAM profile: {profile} (num_gpu={num_gpu})")
+
+    # Size the runtime to this machine (GPU layers, context window, threads, and a model that fits). Never fatal.
+    tuned = autotune.boot(args, args.model, OLLAMA_HOST)
+    if tuned and tuned.get("model_tag") and tuned["model_tag"] != args.model:
+        args.model = tuned["model_tag"]
 
     # Pre-flight check on Ollama connection
     client = OllamaClient(model=args.model)
@@ -124,7 +136,7 @@ def main() -> None:
     print("=" * 60)
     print(f"  Helix Autonomous Coding Assistant (Model: {args.model})")
     print("  Type 'exit' or 'quit' to close. Press Ctrl+C to cancel a turn.")
-    print("  GPU memory: /vram shared | /vram max | /vram cpu | /vram free | /vram status")
+    print("  GPU memory: /vram auto | /vram shared | /vram max | /vram cpu | /vram free | /vram status")
     print("=" * 60)
 
     while True:

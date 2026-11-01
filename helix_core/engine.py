@@ -37,6 +37,9 @@ from helix_core.config import (
     get_num_gpu,
     get_vram_profile,
     llm_options,
+    get_num_ctx,
+    get_hardware_profile,
+    apply_hardware_profile,
     resolve_vram_profile,
     set_vram_profile,
 )
@@ -268,7 +271,9 @@ class OllamaClient:
 class ContextManager:
     """Manages conversational history within context token boundaries."""
 
-    def __init__(self, max_tokens: int = NUM_CTX, budget_ratio: float = 0.85) -> None:
+    def __init__(self, max_tokens: Optional[int] = None, budget_ratio: float = 0.85) -> None:
+        if max_tokens is None:
+            max_tokens = get_num_ctx()      # live: follows the auto-tuned context window
         self.max_tokens = int(max_tokens * budget_ratio)
 
     def estimate_tokens(self, messages: List[Dict[str, Any]]) -> int:
@@ -487,6 +492,31 @@ def _describe_loaded(models: List[Dict[str, Any]]) -> str:
     return "Loaded: " + "; ".join(parts) + "."
 
 
+def _vram_auto(model: str, host: str) -> str:
+    """/vram auto: probe this machine again, tune against what is free RIGHT NOW (memory held by the loaded model counts as free), apply."""
+    from helix_core import hardware
+    try:
+        hw = hardware.probe_hardware()
+        oll = hardware.query_ollama(host, family=str(model).split(":")[0])
+        hw = hardware.adjust_for_resident_models(hw, oll["resident_vram_gb"], oll["resident_ram_gb"])
+        prof = hardware.auto_configure(hw, installed=oll["installed"] or None, overrides={"configured_model": model})
+    except Exception as exc:  # never break the chat loop over a probe problem
+        return f"Hardware auto-tune failed ({exc}); settings unchanged."
+    before = (get_vram_profile(), get_num_gpu(), get_num_ctx())
+    set_active = apply_hardware_profile(hardware.profile_to_dict(prof))
+    if not set_active:
+        return "Hardware auto-tune produced no usable profile; settings unchanged."
+    after = (get_vram_profile(), get_num_gpu(), get_num_ctx())
+    notes = " ".join(prof.warnings[:2])
+    if before == after:
+        return f"Already using the auto-tuned settings: {prof.model_tag}, mode {prof.mode}, num_gpu={prof.num_gpu}, num_ctx={prof.num_ctx}. {notes}".strip()
+    result = unload_model(model=model, host=host)
+    note = "The model was unloaded" if result["unloaded"] else "Ollama could not be reached to unload it"
+    return (f"Auto-tuned: {prof.model_tag} [{prof.quant}], mode {prof.mode}, {prof.gpu_units}/{prof.total_units} layers on GPU "
+            f"(num_gpu={prof.num_gpu}), num_ctx={prof.num_ctx}, num_thread={prof.num_thread}. {note}; the next reply reloads "
+            f"the model with these settings. {notes}").strip()
+
+
 def handle_vram_command(text: str, model: str = MODEL_NAME, host: str = OLLAMA_HOST) -> Optional[str]:
     """Run a /vram command. Returns the reply to print, or None when `text` is not a /vram command (never raises)."""
     match = _VRAM_CMD.match(text or "")
@@ -500,10 +530,18 @@ def handle_vram_command(text: str, model: str = MODEL_NAME, host: str = OLLAMA_H
             return "Model unloaded: its GPU memory is free now. The next reply reloads it (about 40 seconds)."
         return f"Could not unload the model: {result['detail']}"
 
+    if arg == "auto":
+        return _vram_auto(model, host)
+
     if arg == "status":
         profile, num_gpu = get_vram_profile(), get_num_gpu()
         shown = "automatic" if num_gpu is None else f"num_gpu={num_gpu}"
         info = VRAM_PROFILES.get(profile, {}).get("summary", "")
+        hw_prof = get_hardware_profile() if profile == "AUTO" else None
+        if hw_prof:
+            info = (f"auto-tuned: {hw_prof.get('model_tag')} [{hw_prof.get('mode')}], "
+                    f"{hw_prof.get('gpu_units')}/{hw_prof.get('total_units')} layers on GPU, "
+                    f"num_ctx={hw_prof.get('num_ctx')}, num_thread={hw_prof.get('num_thread')}")
         return (f"VRAM profile: {profile} ({shown}){' - ' + info if info else ''}. keep_alive={KEEP_ALIVE}. "
                 f"{_describe_loaded(ollama_ps(host))}")
 

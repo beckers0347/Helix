@@ -60,7 +60,13 @@ Type a request and press Enter. Type `exit` or `quit` to leave. `Ctrl+C` cancels
 | `--build-plugin "description"` | have the model write, test and mount a plugin (see below) |
 | `--model NAME` | use another Ollama model (default `qwen2.5-coder:14b`) |
 | `--no-tools` | plain chat, no tool execution |
-| `--vram max\|shared\|cpu` | starting GPU profile (default `shared`) |
+| `--vram max\|shared\|cpu` | start with a fixed GPU profile (turns hardware auto-tuning off for this run) |
+| `--hardware-info` | show the detected hardware and the settings Helix would use, then exit (`--json` for machine-readable) |
+| `--auto-tune` | re-detect the machine and ignore remembered overrides |
+| `--gpu-layers N\|all` / `--force-cpu` | force how many layers run on the GPU / never use the GPU |
+| `--ctx TOKENS` / `--threads N` | force the context window / CPU thread count |
+| `--save-overrides` | remember the forced values above for later runs on this machine |
+| `--no-hardware-probe` | skip auto-tuning and use the static defaults |
 | `--unload` | unload the model from Ollama (free GPU memory) and exit |
 
 Examples:
@@ -80,14 +86,32 @@ Writes are limited to the three safe folders (see [Safety](#safety-model)).
 
 ---
 
+## Automatic hardware tuning
+
+On every start Helix looks at the computer it is running on and sizes Ollama's runtime to fit, then prints a short report:
+
+- **Detects** RAM (total/free), the GPU (NVIDIA, AMD or Apple; VRAM total/free), CPU cores and AVX2/AVX-512/NEON. No GPU or no driver tools? It falls back to CPU-only instead of failing.
+- **Chooses** how many layers go on the GPU from the VRAM that is actually **free right now**, keeping a 1.5-2 GB safety buffer; a context window of 4096-16384 tokens depending on memory headroom; and one CPU thread per physical core.
+- **Tiers:** High (16 GB+ VRAM or 64 GB+ RAM), Mid (8-12 GB VRAM or 32 GB+ RAM), Low (everything smaller). The report shows the model the tier recommends; Helix keeps **your** configured model and only falls back to a smaller model you have **already installed** if yours cannot fit. It never downloads anything.
+- **Remembers** the result in `config/hardware_profile.json` (git-ignored) and re-detects when the hardware changes.
+
+```bat
+run_helix.bat --hardware-info          rem what was detected and what would be used
+run_helix.bat --force-cpu              rem never touch the GPU
+run_helix.bat --gpu-layers 30 --ctx 4096 --save-overrides
+```
+
+If you pick a split yourself (`--vram`, or the `HELIX_VRAM_PROFILE` / `HELIX_NUM_GPU` environment variables) auto-tuning stays out of the way. Inside a chat, `/vram auto` re-detects and re-tunes (useful after closing a game or a 3D app).
+
 ## GPU memory control (`/vram`)
 
 Large models and creative software compete for VRAM. Helix lets you choose how many of the model's layers live on the GPU, **while chatting**:
 
 | Command | Layers on GPU | What it means |
 |---|---|---|
+| `/vram auto` | sized to your machine | **default at startup**; re-detects free memory and tunes layers, context and threads |
 | `/vram max` | all | fastest; uses ~10 GB of VRAM |
-| `/vram shared` | 24 of 48 | **default**; about half the speed, leaves ~5-6 GB free for other apps (Unreal, Blender, CAD, ...) |
+| `/vram shared` | 24 of 48 | about half the speed, leaves ~5-6 GB free for other apps (Unreal, Blender, CAD, ...) |
 | `/vram cpu` | 0 | no GPU at all; slowest, uses no VRAM |
 | `/vram free` | - | unload the model **now** and free its GPU memory |
 | `/vram status` | - | show the profile, `keep_alive` and what Ollama currently holds |
@@ -167,7 +191,7 @@ All optional. Set them as environment variables before running `run_helix.bat`.
 | `HELIX_KEEP_ALIVE` | `2m` | how long an idle model stays loaded |
 | `HELIX_UNLOAD_ON_EXIT` | `1` | set `0` to keep the model loaded after Helix exits |
 
-Fixed generation settings (in `helix_core/config.py`): temperature 0.1, top_p 0.95, context 8192 tokens, stop token `<|im_end|>`. They are passed on **every** model call.
+Fixed generation settings (in `helix_core/config.py`): temperature 0.1, top_p 0.95, context 8192 tokens by default (auto-tuned to 4096-16384 for your machine, see above), stop token `<|im_end|>`. They are passed on **every** model call.
 
 ---
 
@@ -262,6 +286,8 @@ Helix/
 ├── test_harness.py          the plugin-builder test
 ├── helix_core/              engine
 │   ├── config.py            model options, prompts, VRAM profiles
+│   ├── hardware.py          hardware probe + auto-tuner (pure, stdlib only)
+│   ├── autotune.py          startup hook, CLI flags, saved profile
 │   ├── engine.py            Ollama client, chat loop, /vram commands
 │   ├── toolcalls.py         pure text tool-call parser
 │   ├── codetools.py         read / write / replace / syntax-check tools

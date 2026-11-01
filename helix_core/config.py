@@ -66,7 +66,8 @@ def _parse_num_gpu(raw, default=24):
     return default
 
 
-_ACTIVE = {"profile": DEFAULT_VRAM_PROFILE, "num_gpu": VRAM_PROFILES[DEFAULT_VRAM_PROFILE]["num_gpu"]}
+_ACTIVE = {"profile": DEFAULT_VRAM_PROFILE, "num_gpu": VRAM_PROFILES[DEFAULT_VRAM_PROFILE]["num_gpu"],
+           "num_ctx": None, "num_thread": None, "hardware": None}
 
 
 def _init_vram_state():
@@ -107,6 +108,43 @@ def set_vram_profile(name):
     return True, changed, key, _ACTIVE["num_gpu"]
 
 
+def get_num_ctx():
+    """Context window in tokens: the auto-tuned value once a hardware profile is applied, else NUM_CTX. Read at CALL TIME."""
+    return _ACTIVE["num_ctx"] or NUM_CTX
+
+
+def get_num_thread():
+    """CPU threads for inference (None = let Ollama decide). Read at CALL TIME."""
+    return _ACTIVE["num_thread"]
+
+
+def get_hardware_profile():
+    """The applied hardware profile dict (see helix_core.hardware.profile_to_dict) or None."""
+    return _ACTIVE["hardware"]
+
+
+def apply_hardware_profile(profile):
+    """Adopt an auto-tuned hardware profile (dict) as the ACTIVE runtime settings: profile name AUTO, num_gpu, ctx, threads.
+
+    Call once at startup (before any request) and again only when the user asks for /vram auto: Ollama reloads the model
+    whenever num_gpu/num_ctx change, so these values must stay constant while the model is loaded. Never raises.
+    """
+    global MODEL_NAME
+    if not isinstance(profile, dict):
+        return False
+    _ACTIVE["hardware"] = dict(profile)
+    _ACTIVE["profile"] = "AUTO"
+    _ACTIVE["num_gpu"] = profile.get("num_gpu")
+    ctx = profile.get("num_ctx")
+    _ACTIVE["num_ctx"] = int(ctx) if ctx else None
+    thread = profile.get("num_thread")
+    _ACTIVE["num_thread"] = int(thread) if thread else None
+    tag = profile.get("model_tag")
+    if tag:
+        MODEL_NAME = str(tag)
+    return True
+
+
 def llm_options(**extra):
     """The Ollama `options` payload for EVERY chat/generate call, including the ACTIVE num_gpu.
 
@@ -116,13 +154,16 @@ def llm_options(**extra):
     options = {
         "temperature": TEMPERATURE,
         "top_p": TOP_P,
-        "num_ctx": NUM_CTX,
+        "num_ctx": get_num_ctx(),
         "num_predict": NUM_PREDICT,
         "stop": list(STOP_TOKENS),
     }
     num_gpu = get_num_gpu()
     if num_gpu is not None:
         options["num_gpu"] = num_gpu
+    num_thread = get_num_thread()
+    if num_thread:
+        options["num_thread"] = num_thread
     options.update(extra)
     return options
 REQUEST_TIMEOUT = 300.0

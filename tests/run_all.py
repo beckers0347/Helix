@@ -44,6 +44,7 @@ def main() -> int:
         ("Helix Core Test Suite", tests_dir / "test_helix_core.py"),
         ("Helix Training Data Pipeline Suite", tests_dir / "test_training_data.py"),
         ("Helix Unsloth Trainer Suite", tests_dir / "test_training_trainer.py"),
+        ("Helix Hardware Auto-Tune Suite", tests_dir / "test_hardware.py"),
     ]
 
     print("=" * 70)
