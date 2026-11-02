@@ -34,15 +34,18 @@ from helix_core.config import (
     TEMPERATURE,
     TOP_P,
     VRAM_PROFILES,
+    apply_hardware_profile,
+    get_hardware_profile,
+    get_num_ctx,
     get_num_gpu,
+    get_num_thread,
+    get_request_timeout,
     get_vram_profile,
     llm_options,
-    get_num_ctx,
-    get_hardware_profile,
-    apply_hardware_profile,
     resolve_vram_profile,
     set_vram_profile,
 )
+from helix_core.honesty import TurnEvents, sanitize_reply
 from helix_core.paths import HELIX_ROOT
 from helix_core.plugin_manager import PluginManager
 from helix_core.security import PathSecurityGuard
@@ -159,11 +162,16 @@ class OllamaClient:
         self,
         host: str = OLLAMA_HOST,
         model: str = MODEL_NAME,
-        timeout: float = REQUEST_TIMEOUT,
+        timeout: Optional[float] = None,
     ) -> None:
         self.host = host.rstrip("/")
         self.model = model
-        self.timeout = timeout
+        self._custom_timeout = timeout is not None
+        self.timeout = timeout if self._custom_timeout else REQUEST_TIMEOUT
+
+    def get_effective_timeout(self) -> float:
+        """Return the active timeout: explicitly passed value, or live adaptive timeout."""
+        return self.timeout if self._custom_timeout else get_request_timeout()
 
     def check_connection(self) -> Tuple[bool, str]:
         """Verify Ollama daemon is reachable."""
@@ -205,14 +213,15 @@ class OllamaClient:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Send chat request to Ollama."""
+        """Send chat request to Ollama using live adaptive timeout."""
         options = llm_options()
+        eff_timeout = self.get_effective_timeout()
 
         # Try official ollama package first
         try:
             import ollama
 
-            client = ollama.Client(host=self.host, timeout=self.timeout)
+            client = ollama.Client(host=self.host, timeout=eff_timeout)
             kwargs: Dict[str, Any] = {
                 "model": self.model,
                 "messages": messages,
@@ -255,7 +264,7 @@ class OllamaClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=eff_timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 msg = data.get("message", {})
                 return {
@@ -318,6 +327,11 @@ class CoreEngine:
         self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
+        self.last_turn_status: Dict[str, Any] = {
+            "status": "success",
+            "task": "",
+            "error": "",
+        }
 
     def _get_active_tool_schemas(self) -> List[Dict[str, Any]]:
         schemas = list(BUILTIN_TOOL_SCHEMAS)
@@ -331,7 +345,12 @@ class CoreEngine:
             names.update(self.plugin_manager._active_tools.keys())
         return names
 
-    def dispatch_tool(self, name: str, args: Dict[str, Any]) -> str:
+    def dispatch_tool(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        turn_events: Optional[TurnEvents] = None,
+    ) -> str:
         """Dispatch a tool call to built-in code tools or dynamic plugins."""
         try:
             if name == "read_file":
@@ -342,29 +361,53 @@ class CoreEngine:
                     base_dir=self.base_dir,
                 )
             elif name == "write_file":
-                return write_file(
+                res = write_file(
                     filepath=args.get("filepath", ""),
                     content=args.get("content", ""),
                     security_guard=self.security_guard,
                 )
+                if turn_events is not None and "Successfully created" in res:
+                    try:
+                        target = self.security_guard.validate_write(args.get("filepath", ""))
+                        if target.exists():
+                            turn_events.add_file_written(target)
+                    except Exception:
+                        pass
+                return res
             elif name == "replace_in_file":
-                return replace_in_file(
+                res = replace_in_file(
                     filepath=args.get("filepath", ""),
                     old_text=args.get("old_text", ""),
                     new_text=args.get("new_text", ""),
                     count=int(args.get("count", 1)),
                     security_guard=self.security_guard,
                 )
+                if turn_events is not None and "Successfully updated" in res:
+                    try:
+                        target = self.security_guard.validate_write(args.get("filepath", ""))
+                        if target.exists():
+                            turn_events.add_file_written(target)
+                    except Exception:
+                        pass
+                return res
             elif name == "check_syntax":
                 return check_syntax(
                     path_or_code=args.get("path_or_code", ""),
                     base_dir=self.base_dir,
                 )
             elif name == "run_python_test":
-                return run_python_test(
+                res = run_python_test(
                     test_path=args.get("test_path", ""),
                     base_dir=self.base_dir,
                 )
+                if turn_events is not None:
+                    passed = "TEST PASS" in res
+                    turn_events.add_test_execution(
+                        test_path=args.get("test_path", ""),
+                        passed=passed,
+                        output=res,
+                    )
+                return res
             elif name == "create_plugin":
                 res = create_plugin(
                     name=args.get("name", ""),
@@ -372,7 +415,22 @@ class CoreEngine:
                     test_code=args.get("test_code", ""),
                     plugin_manager=self.plugin_manager,
                 )
-                return json.dumps(res)
+                res_str = json.dumps(res) if not isinstance(res, str) else res
+                if turn_events is not None:
+                    try:
+                        data = json.loads(res_str)
+                        if isinstance(data, dict) and data.get("status") == "success":
+                            norm = args.get("name", "").strip().replace("-", "_")
+                            tool_p = self.base_dir / "plugins" / "custom_tools" / f"{norm}.py"
+                            test_p = self.base_dir / "plugins" / "tests" / f"test_{norm}.py"
+                            if tool_p.exists():
+                                turn_events.add_file_written(tool_p)
+                            if test_p.exists():
+                                turn_events.add_file_written(test_p)
+                            turn_events.add_test_execution(str(test_p), passed=True, output="PASS")
+                    except Exception:
+                        pass
+                return res_str
             elif name == "list_plugins":
                 return json.dumps(list_plugins(self.plugin_manager))
             else:
@@ -383,8 +441,56 @@ class CoreEngine:
             return f"Error executing tool '{name}': {exc}"
 
     def run_turn(self, user_text: str, max_rounds: int = 10) -> str:
-        """Run an agentic conversational turn with tool execution loop."""
-        self.messages.append({"role": "user", "content": user_text})
+        """Run an agentic conversational turn with tool execution loop and honesty verification."""
+        turn_events = TurnEvents()
+
+        # Handle short follow-up resumption after failure/timeout
+        continuation_words = {"continue", "go on", "try again", "keep going", "retry", "proceed", "resume", "carry on"}
+        clean_user = user_text.strip().lower().rstrip(".?!")
+        effective_user_text = user_text
+
+        if clean_user in continuation_words and self.last_turn_status.get("status") in ("timeout", "error", "failed"):
+            prev_task = self.last_turn_status.get("task", "")
+            prev_error = self.last_turn_status.get("error", "")
+            effective_user_text = (
+                f"Resume and continue the task: '{prev_task}'.\n"
+                f"Previous status or failure context: {prev_error}.\n"
+                "Please execute real tool calls (write_file, run_python_test) to complete and verify the implementation. "
+                "Do not output plain prose claims without executing the tools."
+            )
+
+        # Check if standalone CLI project request
+        from helix_core.quality import classify_project_request
+        if classify_project_request(effective_user_text) == "standalone" and clean_user not in continuation_words:
+            from helix_core.standalone_builder import build_standalone_project_staged
+            try:
+                success, final_msg, details = build_standalone_project_staged(self, effective_user_text)
+                self.last_turn_status = {
+                    "status": "success" if success else "failed",
+                    "task": user_text,
+                    "error": "" if success else details.get("error", "Tests failed"),
+                }
+                self.messages.append({"role": "assistant", "content": final_msg})
+                return final_msg
+            except TimeoutError:
+                eff_timeout = (
+                    getattr(self.client, "get_effective_timeout", lambda: 300.0)()
+                    if hasattr(self.client, "get_effective_timeout")
+                    else getattr(self.client, "timeout", 300.0)
+                )
+                err_msg = (
+                    f"Model request timed out after {eff_timeout:.0f} seconds. Ollama may be loading weights or overloaded. "
+                    "Your progress has been preserved; you can say 'continue' to resume."
+                )
+                self.messages.append({"role": "assistant", "content": err_msg})
+                self.last_turn_status = {
+                    "status": "timeout",
+                    "task": user_text,
+                    "error": f"Request timed out after {eff_timeout:.0f}s",
+                }
+                return err_msg
+
+        self.messages.append({"role": "user", "content": effective_user_text})
         self.messages = self.context_manager.prune_history(self.messages)
 
         tool_schemas = self._get_active_tool_schemas()
@@ -394,12 +500,30 @@ class CoreEngine:
             try:
                 response = self.client.chat(self.messages, tools=tool_schemas)
             except TimeoutError:
-                err_msg = "Model request timed out after 300 seconds. Ollama may be loading weights or overloaded."
+                eff_timeout = (
+                    getattr(self.client, "get_effective_timeout", lambda: 300.0)()
+                    if hasattr(self.client, "get_effective_timeout")
+                    else getattr(self.client, "timeout", 300.0)
+                )
+                err_msg = (
+                    f"Model request timed out after {eff_timeout:.0f} seconds. Ollama may be loading weights or overloaded. "
+                    "Your progress has been preserved; you can say 'continue' to resume."
+                )
                 self.messages.append({"role": "assistant", "content": err_msg})
+                self.last_turn_status = {
+                    "status": "timeout",
+                    "task": user_text if clean_user not in continuation_words else self.last_turn_status.get("task", user_text),
+                    "error": f"Request timed out after {eff_timeout:.0f}s",
+                }
                 return err_msg
             except Exception as exc:
                 err_msg = f"Inference error: {exc}"
                 self.messages.append({"role": "assistant", "content": err_msg})
+                self.last_turn_status = {
+                    "status": "error",
+                    "task": user_text if clean_user not in continuation_words else self.last_turn_status.get("task", user_text),
+                    "error": str(exc),
+                }
                 return err_msg
 
             content = response.get("content", "")
@@ -423,18 +547,31 @@ class CoreEngine:
             if not tool_calls and content:
                 tool_calls = parse_tool_calls(content, registered_names)
 
-            # If no tool calls, return visible text
+            # If no tool calls, verify honesty and return visible text
             if not tool_calls:
-                visible_text = content.strip() if content else "(No response generated)"
-                self.messages.append({"role": "assistant", "content": visible_text})
-                return visible_text
+                raw_visible = content.strip() if content else "(No response generated)"
+                sanitized, intercepted = sanitize_reply(raw_visible, turn_events, self.base_dir)
+                if intercepted:
+                    self.last_turn_status = {
+                        "status": "failed",
+                        "task": user_text if clean_user not in continuation_words else self.last_turn_status.get("task", user_text),
+                        "error": "Model produced unverified claims without tool execution",
+                    }
+                else:
+                    self.last_turn_status = {
+                        "status": "success",
+                        "task": user_text if clean_user not in continuation_words else self.last_turn_status.get("task", user_text),
+                        "error": "",
+                    }
+                self.messages.append({"role": "assistant", "content": sanitized})
+                return sanitized
 
             # Execute tool calls
             self.messages.append({"role": "assistant", "content": content or ""})
             for tc in tool_calls:
                 name = tc["name"]
                 args = tc.get("arguments", {})
-                result = self.dispatch_tool(name, args)
+                result = self.dispatch_tool(name, args, turn_events=turn_events)
                 self.messages.append(
                     {
                         "role": "tool",
@@ -445,9 +582,27 @@ class CoreEngine:
             # Prune context before next round
             self.messages = self.context_manager.prune_history(self.messages)
 
-        final_msg = "Reached maximum tool execution rounds."
-        self.messages.append({"role": "assistant", "content": final_msg})
-        return final_msg
+        files_str = ", ".join(f"`{p.name}`" for p in turn_events.files_written if p.exists()) if turn_events.files_written else "None"
+        last_test = turn_events.tests_executed[-1] if turn_events.tests_executed else None
+        test_info = ""
+        if last_test:
+            status = "PASSED" if last_test.get("passed") else "FAILED"
+            test_info = f"\n- Last test ({last_test.get('test_path', '')}): {status}\n```text\n{last_test.get('output', '').strip()[:400]}\n```"
+        final_msg = (
+            f"Reached maximum tool execution rounds ({max_rounds}).\n\n"
+            f"### Turn Status Summary:\n"
+            f"- Files written: {files_str}\n"
+            f"- Tests executed: {len(turn_events.tests_executed)}{test_info}\n\n"
+            "Task is incomplete. Review the files and errors above before proceeding."
+        )
+        sanitized, _ = sanitize_reply(final_msg, turn_events, self.base_dir)
+        self.last_turn_status = {
+            "status": "failed",
+            "task": user_text if clean_user not in continuation_words else self.last_turn_status.get("task", user_text),
+            "error": "Max execution rounds reached",
+        }
+        self.messages.append({"role": "assistant", "content": sanitized})
+        return sanitized
 
 
 def unload_model(model: str = MODEL_NAME, host: str = OLLAMA_HOST) -> Dict[str, Any]:

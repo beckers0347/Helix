@@ -62,10 +62,10 @@ class PluginManager:
         default_timeout: float = 30.0,
     ) -> None:
         self.base_dir = (base_dir or HELIX_ROOT).resolve()
-        self.custom_tools_dir = (custom_tools_dir or CUSTOM_TOOLS_DIR).resolve()
-        self.tests_dir = (tests_dir or PLUGINS_TESTS_DIR).resolve()
-        self.quarantine_dir = (quarantine_dir or QUARANTINE_DIR).resolve()
-        self.registry_path = (registry_path or REGISTRY_PATH).resolve()
+        self.custom_tools_dir = (custom_tools_dir or (self.base_dir / "plugins" / "custom_tools")).resolve()
+        self.tests_dir = (tests_dir or (self.base_dir / "plugins" / "tests")).resolve()
+        self.quarantine_dir = (quarantine_dir or (self.base_dir / "plugins" / "quarantine")).resolve()
+        self.registry_path = (registry_path or (self.base_dir / "plugins" / "registry.json")).resolve()
         self.default_timeout = default_timeout
 
         self._active_tools: Dict[str, BaseTool] = {}
@@ -247,7 +247,14 @@ class PluginManager:
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
-        env["PYTHONPATH"] = str(self.base_dir)
+        sep = ";" if sys.platform == "win32" else ":"
+        paths = [str(self.base_dir)]
+        if str(HELIX_ROOT) != str(self.base_dir):
+            paths.append(str(HELIX_ROOT))
+        existing_pp = env.get("PYTHONPATH")
+        if existing_pp:
+            paths.append(existing_pp)
+        env["PYTHONPATH"] = sep.join(paths)
 
         try:
             res = subprocess.run(
@@ -391,6 +398,13 @@ class PluginManager:
 
         self.custom_tools_dir.mkdir(parents=True, exist_ok=True)
         self.tests_dir.mkdir(parents=True, exist_ok=True)
+        plugins_dir = self.custom_tools_dir.parent
+        plugins_init = plugins_dir / "__init__.py"
+        if not plugins_init.exists():
+            plugins_init.write_text("# Helix dynamic plugins package\n", encoding="utf-8")
+        tools_init = self.custom_tools_dir / "__init__.py"
+        if not tools_init.exists():
+            tools_init.write_text("# Helix custom tools package\n", encoding="utf-8")
 
         # Write files
         tool_file.write_text(code, encoding="utf-8")

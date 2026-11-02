@@ -203,7 +203,14 @@ def run_python_test(
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
-    env["PYTHONPATH"] = str(root)
+    sep = ";" if sys.platform == "win32" else ":"
+    paths = [str(root)]
+    if str(HELIX_ROOT) != str(root):
+        paths.append(str(HELIX_ROOT))
+    existing_pp = env.get("PYTHONPATH")
+    if existing_pp:
+        paths.append(existing_pp)
+    env["PYTHONPATH"] = sep.join(paths)
 
     try:
         proc = subprocess.run(

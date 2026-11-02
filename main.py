@@ -12,6 +12,7 @@ from helix_core.config import MODEL_NAME, OLLAMA_HOST, PLUGIN_BUILDER_PROMPT
 from helix_core.config import set_vram_profile
 from helix_core.engine import CoreEngine, OllamaClient, handle_vram_command, unload_model
 from helix_core.paths import init_user_workspace
+from helix_core.plugin_builder import build_plugin_staged, parse_code_blocks
 from helix_core.plugin_manager import PluginManager
 
 
@@ -24,12 +25,6 @@ UNLOAD_PHRASES = {
 def is_unload_command(text: str) -> bool:
     """True only for an exact unload phrase, so ordinary sentences ('unload the dishwasher') are never hijacked."""
     return " ".join((text or "").lower().replace("?", " ").replace(".", " ").split()) in UNLOAD_PHRASES
-
-
-def parse_code_blocks(text: str) -> list[str]:
-    """Extract fenced python code blocks from text."""
-    blocks = re.findall(r"```(?:python)?\s*([\s\S]*?)\s*```", text)
-    return [b.strip() for b in blocks if b.strip()]
 
 
 def main() -> None:
@@ -98,32 +93,19 @@ def main() -> None:
         plugin_manager=None if args.no_tools else plugin_manager,
     )
 
-    # 1. Build plugin mode
+    # 1. Build plugin mode (staged with self-correction)
     if args.build_plugin:
-        prompt = (
-            f"{PLUGIN_BUILDER_PROMPT}\n\n"
-            f"Generate a dynamic plugin satisfying this request:\n{args.build_plugin}"
+        print(f"[*] Building plugin for request: {args.build_plugin}...")
+        success, msg, _plugin_name = build_plugin_staged(
+            engine=engine,
+            plugin_manager=plugin_manager,
+            request_text=args.build_plugin,
         )
-        print(f"[*] Prompting {args.model} to author plugin for: {args.build_plugin}...")
-        reply = engine.run_turn(prompt)
-        blocks = parse_code_blocks(reply)
-        if len(blocks) < 2:
-            print("[ERROR] Expected at least 2 python code blocks (tool and test). Model returned:", file=sys.stderr)
-            print(reply, file=sys.stderr)
-            sys.exit(1)
-
-        tool_code, test_code = blocks[0], blocks[1]
-        # Infer name from class or regex
-        name_match = re.search(r'name\s*:\s*str\s*=\s*["\']([^"\']+)["\']', tool_code)
-        plugin_name = name_match.group(1) if name_match else "custom_tool"
-
-        res = plugin_manager.create_or_update_plugin(plugin_name, tool_code, test_code)
-        if res.status == "success":
-            print(f"[PASS] Plugin '{plugin_name}' successfully built, tested, and mounted.")
-            print(res.output)
+        if success:
+            print(msg)
             sys.exit(0)
         else:
-            print(f"[FAIL] Plugin creation failed: {res.error_trace}", file=sys.stderr)
+            print(msg, file=sys.stderr)
             sys.exit(1)
 
     # 2. Single turn mode

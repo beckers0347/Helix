@@ -403,8 +403,19 @@ def _probe_nvidia_gpus(timeout: float, notes: List[str]) -> List[GpuInfo]:
             try:
                 idx = int(parts[0])
                 name = parts[1]
+                # Reject [N/A] or non-numeric tokens
+                if parts[2].upper() in ("[N/A]", "N/A", "NONE", "") or parts[3].upper() in ("[N/A]", "N/A", "NONE", ""):
+                    notes.append(f"nvidia-smi reported [N/A] memory values on line '{line}'.")
+                    continue
                 tot_mib = float(parts[2])
                 free_mib = float(parts[3])
+                import math
+                if not (math.isfinite(tot_mib) and math.isfinite(free_mib)):
+                    notes.append(f"nvidia-smi reported non-finite memory values ({tot_mib}, {free_mib}).")
+                    continue
+                if tot_mib <= 0 or free_mib < 0 or free_mib > tot_mib:
+                    notes.append(f"nvidia-smi reported invalid memory bounds (total={tot_mib}, free={free_mib}).")
+                    continue
                 driver = parts[4]
                 cc = parts[5] if len(parts) >= 6 else ""
                 gpus.append(
@@ -1156,9 +1167,22 @@ def format_banner(
     ]
 
     if hw.gpu:
-        lines.append(
-            f"  GPU:        {hw.gpu.name} ({hw.gpu.vram_total_gb:.1f} GB VRAM, {hw.gpu.vram_free_gb:.1f} GB Free)"
+        import math
+        tot_valid = math.isfinite(hw.gpu.vram_total_gb) and hw.gpu.vram_total_gb > 0
+        free_valid = (
+            math.isfinite(hw.gpu.vram_free_gb)
+            and 0 <= hw.gpu.vram_free_gb <= hw.gpu.vram_total_gb
         )
+        if tot_valid and free_valid:
+            mem_str = f"({hw.gpu.vram_total_gb:.1f} GB VRAM, {hw.gpu.vram_free_gb:.1f} GB Free)"
+        elif tot_valid:
+            mem_str = f"({hw.gpu.vram_total_gb:.1f} GB VRAM)"
+        else:
+            mem_str = ""
+        gpu_line = f"  GPU:        {hw.gpu.name}"
+        if mem_str:
+            gpu_line += f" {mem_str}"
+        lines.append(gpu_line)
         drv_info = f"Driver {hw.gpu.driver}" if hw.gpu.driver else "Driver Active"
         if hw.gpu.compute_capability:
             drv_info += f" (Compute {hw.gpu.compute_capability})"
@@ -1323,8 +1347,11 @@ def adjust_for_resident_models(hw: HardwareInfo, resident_vram_gb: float, reside
     never beyond the card's total VRAM / the machine's total RAM. Pure; a no-op without a discrete GPU or for unified memory.
     """
     try:
-        gpu_extra = max(0.0, float(resident_vram_gb or 0.0))
-        ram_extra = max(0.0, float(resident_ram_gb or 0.0))
+        import math
+        raw_gpu = float(resident_vram_gb or 0.0)
+        gpu_extra = max(0.0, raw_gpu) if math.isfinite(raw_gpu) else 0.0
+        raw_ram = float(resident_ram_gb or 0.0)
+        ram_extra = max(0.0, raw_ram) if math.isfinite(raw_ram) else 0.0
         new_hw = hw
         notes = list(hw.notes)
         g = hw.gpu

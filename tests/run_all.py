@@ -15,6 +15,9 @@ import subprocess
 import sys
 import time
 
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 
 def run_suite(name: str, script_path: Path) -> tuple[bool, str]:
     env = dict(os.environ)
@@ -45,6 +48,7 @@ def main() -> int:
         ("Helix Training Data Pipeline Suite", tests_dir / "test_training_data.py"),
         ("Helix Unsloth Trainer Suite", tests_dir / "test_training_trainer.py"),
         ("Helix Hardware Auto-Tune Suite", tests_dir / "test_hardware.py"),
+        ("Helix Dev-Ability Fixes Suite", tests_dir / "test_dev_fixes.py"),
     ]
 
     print("=" * 70)

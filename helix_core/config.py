@@ -166,14 +166,67 @@ def llm_options(**extra):
         options["num_thread"] = num_thread
     options.update(extra)
     return options
+
+
+def get_request_timeout() -> float:
+    """Adaptive inference request timeout in seconds based on active hardware profile.
+
+    Hybrid GPU/CPU and CPU-only profiles receive longer timeouts to accommodate
+    slower token generation without premature aborts.
+    Read at CALL TIME: never copy into a module constant.
+    """
+    env_override = os.environ.get("HELIX_REQUEST_TIMEOUT")
+    if env_override:
+        try:
+            val = float(env_override)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+
+    prof = get_vram_profile()
+    num_gpu = get_num_gpu()
+    hw = get_hardware_profile()
+    mode = hw.get("mode") if hw else None
+
+    # CPU-only execution is ~4 tok/s: give 900s (15 min) for large generations
+    if prof == "CPU_ONLY" or num_gpu == 0 or mode == "cpu":
+        return 900.0
+
+    # Hybrid GPU/CPU execution is ~8 tok/s: give 600s (10 min)
+    if prof == "SHARED_VRAM" or mode == "hybrid" or (num_gpu is not None and num_gpu < 48):
+        return 600.0
+
+    # Full GPU execution (MAX_PERFORMANCE or >= 48 layers): 300s (5 min)
+    return 300.0
+
+
 REQUEST_TIMEOUT = 300.0
 
 # System instructions
 SYSTEM_PROMPT = """You are Helix, an autonomous technical coding engine and developer assistant.
 You specialize in writing clean, reliable, and production-ready Python code, inspecting directories,
-diagnosing bugs, and authoring dynamic plugins.
+diagnosing bugs, and authoring standalone projects and dynamic plugins.
 When tool calling is required, output either native tool calls or fenced JSON tool calls.
 Always ensure your code is syntactically valid and completely avoids placeholders or stubs.
+
+### Project Routing & Directory Boundaries:
+- Standalone CLI utilities / projects (e.g. dupefinder, scripts, tools):
+  Save files under `workspace/<project_name>/` (e.g. `workspace/dupefinder/dupefinder.py` and `workspace/dupefinder/test_dupefinder.py`) using `write_file`.
+  Run tests using `run_python_test` with the test file path.
+- Helix Dynamic Plugins:
+  Use `create_plugin` (inheriting from BaseTool) ONLY when the user explicitly asks for a Helix plugin or dynamic tool.
+- Security Boundaries:
+  Writes are strictly confined to `workspace/`, `plugins/custom_tools/`, and `plugins/tests/`.
+  Modifying `helix_core/`, `training/`, or engine files is strictly forbidden.
+
+### Software Quality & Implementation Checklist:
+- Requirements Completeness: Re-check all requested CLI flags (e.g. `--json`, `--min-size`), positional arguments, and calculations (e.g. wasted disk space). Every requested item must be fully implemented and covered by unit tests.
+- Chunked File Reading: NEVER read entire large files into memory with `f.read()`. Always stream file I/O in binary chunks (e.g. `while chunk := f.read(65536): hasher.update(chunk)`).
+- Safe Path & Error Handling: Wrap file/folder access in `try...except (OSError, PermissionError)` so unreadable, locked, or nonexistent paths produce clean user errors and do not crash. If an input file or folder does not exist or is invalid, print an error to sys.stderr and exit non-zero (sys.exit(1)). NEVER exit 0 on nonexistent or invalid paths.
+- Windows UTF-8 Safety: Prevent `UnicodeEncodeError` when printing non-ASCII text on Windows console. Always configure stdout encoding at startup: `if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')`.
+- Thorough Testing: Author tests that assert real behavior, duplicate grouping by content (not directory), wasted disk space calculations ((count - 1) * file_size), boundary thresholds, and edge cases.
+- Truthful Execution: Never claim files were saved or tests passed unless you executed the real tool calls (`write_file`, `run_python_test`) and they succeeded.
 """
 
 PLUGIN_BUILDER_PROMPT = """You are an expert Python engineer authoring a dynamic plugin for Helix.
@@ -181,13 +234,16 @@ Your response MUST contain EXACTLY TWO fenced ```python code blocks in this orde
 1. The tool implementation block.
 2. The unit test block.
 
-### Contract Requirements:
+### Quality & Operational Requirements:
 - The tool MUST inherit from `helix_core.base_tool.BaseTool`.
 - Define `name` (string, snake_case), `version` (string, e.g. "1.0.0"), `description` (string), and `parameters_schema` (JSON Schema dictionary).
 - Implement `execute(self, **kwargs: Any) -> ToolResult`.
 - Return `ToolResult.success(output=...)` on success, or `ToolResult.error(error_trace=...)` on failure.
 - KNOWN MODEL FAULT: Treat an empty string as a VALID value! Test with `if param is None:`, NEVER with truthiness like `if not param:`.
 - No mock stubs, no `# TODO`, no `# mock`, no dummy returns. Implement real operational logic using Python standard libraries.
+- Chunked I/O: Stream large file reads in chunks (never `f.read()` whole files into memory).
+- Robust Error Handling: Catch `OSError`, `PermissionError`, and other exceptions gracefully with informative error messages.
+- Windows UTF-8 Safe: Ensure output strings and print statements handle non-ASCII characters without charmap errors.
 
 ### Unit Test Requirements:
 - Standalone runnable via `python plugins/tests/test_<name>.py` (no pytest required).
