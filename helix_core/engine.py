@@ -465,8 +465,9 @@ class CoreEngine:
             from helix_core.standalone_builder import build_standalone_project_staged
             try:
                 success, final_msg, details = build_standalone_project_staged(self, effective_user_text)
+                is_timeout = "timed out" in final_msg.lower() or details.get("status") == "timeout"
                 self.last_turn_status = {
-                    "status": "success" if success else "failed",
+                    "status": "success" if success else ("timeout" if is_timeout else "failed"),
                     "task": user_text,
                     "error": "" if success else details.get("error", "Tests failed"),
                 }

@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 from typing import Any, Dict, List, Optional
@@ -596,6 +597,10 @@ def test_h3_standalone_staged_builder_success_and_failure() -> None:
                 return {"content": self.responses.pop(0)}
             return {"content": "no response"}
 
+    mocktool_dir = HELIX_ROOT / "workspace" / "mocktool"
+    if mocktool_dir.exists():
+        shutil.rmtree(mocktool_dir, ignore_errors=True)
+
     valid_tool = (
         "import sys, os, argparse\n"
         "if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):\n"
@@ -1007,6 +1012,581 @@ def test_r3_honesty_guard_legitimate_failure_not_rewritten() -> None:
     assert "tests still failing after 2 attempts" in sanitized
     assert "Invented test pass claims were removed" not in sanitized
 
+
+
+# -----------------------------------------------------------------------------
+# Round 4 Tests (R4-1 to R4-4)
+# -----------------------------------------------------------------------------
+
+def test_r4_timeout_in_test_stage_preserves_tool() -> None:
+    """R4-1: Timeout during test generation preserves tool code and resumes in attempt 2."""
+    import tempfile, shutil
+    from helix_core.standalone_builder import build_standalone_project_staged
+
+    tool_code = """
+import sys, os, argparse
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+parser = argparse.ArgumentParser()
+parser.add_argument('file')
+parser.add_argument('--json', action='store_true')
+args = parser.parse_args()
+if not os.path.exists(args.file):
+    print("error", file=sys.stderr)
+    sys.exit(1)
+print("ok")
+"""
+    passing_test = """
+import unittest
+class T(unittest.TestCase):
+    def test_ok(self):
+        self.assertEqual(1, 1)
+if __name__ == '__main__':
+    unittest.main()
+"""
+    call_count = 0
+    class StagedTimeoutClient:
+        def chat(self, messages: Any, tools: Any = None) -> Dict[str, Any]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {"content": f"```python\n{tool_code}\n```"}
+            elif call_count == 2:
+                raise TimeoutError("Model read timeout 300s during test gen")
+            else:
+                return {"content": f"```python\n{passing_test}\n```"}
+
+    engine = CoreEngine(client=StagedTimeoutClient())
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir) / "workspace" / "dupefinder"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
+        success, msg, details = build_standalone_project_staged(
+            engine,
+            "Build me a command-line tool called dupefinder. It needs a --json option.",
+            max_attempts=3,
+        )
+        assert success is True
+        assert (proj_dir / "dupefinder.py").exists()
+        assert (proj_dir / "test_dupefinder.py").exists()
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r4_all_attempts_timeout_truthfully_reports_files() -> None:
+    """R4-1: If all attempts time out, builder truthfully reports timeouts and names files on disk."""
+    import tempfile, shutil
+    from helix_core.standalone_builder import build_standalone_project_staged
+
+    class AllTimeoutClient:
+        def chat(self, messages: Any, tools: Any = None) -> Dict[str, Any]:
+            raise TimeoutError("Persistent model read timeout 300s")
+
+    engine = CoreEngine(client=AllTimeoutClient())
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir) / "workspace" / "dupefinder"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
+        success, msg, details = build_standalone_project_staged(
+            engine,
+            "Build me a command-line tool called dupefinder. It needs a --json option.",
+            max_attempts=2,
+        )
+        assert success is False
+        assert "all 2 attempts timed out" in msg.lower()
+        assert details["status"] == "failed"
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r4_timeout_in_fix_stage_preserves_files() -> None:
+    """R4-1: Timeout during self-correction fix preserves tool and test files on disk and records in build log."""
+    import tempfile, shutil
+    from helix_core.standalone_builder import build_standalone_project_staged
+
+    tool_code = """
+import sys, os, argparse
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+parser = argparse.ArgumentParser()
+parser.add_argument('file')
+parser.add_argument('--json', action='store_true')
+args = parser.parse_args()
+if not os.path.exists(args.file):
+    print("error", file=sys.stderr)
+    sys.exit(1)
+print("ok")
+"""
+    failing_test = """
+import unittest
+class T(unittest.TestCase):
+    def test_fail(self):
+        self.assertEqual(1, 2)
+if __name__ == '__main__':
+    unittest.main()
+"""
+    call_count = 0
+    class FixTimeoutClient:
+        def chat(self, messages: Any, tools: Any = None) -> Dict[str, Any]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {"content": f"```python\n{tool_code}\n```"}
+            elif call_count == 2:
+                return {"content": f"```python\n{failing_test}\n```"}
+            else:
+                raise TimeoutError("HTTP read timeout 300s in fix stage")
+
+    engine = CoreEngine(client=FixTimeoutClient())
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir) / "workspace" / "dupefinder"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
+        success, msg, details = build_standalone_project_staged(
+            engine,
+            "Build me a command-line tool called dupefinder. It needs a --json option.",
+            max_attempts=2,
+        )
+        assert success is False
+        assert (proj_dir / "dupefinder.py").exists()
+        assert (proj_dir / "test_dupefinder.py").exists()
+        fix_log = proj_dir / ".build_log" / "attempt_1" / "fix_timeout.txt"
+        assert fix_log.exists()
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r4_arbitration_locks_tool_sha_on_test_defect() -> None:
+    """R4-3: Arbitration classifies test defect and locks tool SHA256; candidate tool update is rejected."""
+    import tempfile, shutil
+    from helix_core.quality import arbitrate_test_failure
+    from helix_core.standalone_builder import build_standalone_project_staged
+
+    good_tool = """
+import sys, os, argparse
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+parser = argparse.ArgumentParser()
+parser.add_argument('file')
+parser.add_argument('--json', action='store_true')
+args = parser.parse_args()
+if not os.path.exists(args.file):
+    print("error", file=sys.stderr)
+    sys.exit(1)
+print("ok")
+"""
+    arb = arbitrate_test_failure(
+        "Build me a command-line tool called dupefinder. It needs a --json option.",
+        tool_code=good_tool,
+        test_code="def test_bad(self): pass",
+        test_output="AssertionError: 'a' unexpectedly found in output",
+        failing_tests=["test_bad"],
+        smoke_passed=True,
+        coverage_passed=True,
+        memory_passed=True,
+    )
+    assert arb["classification"] == "TEST"
+    assert arb["lock_tool"] is True
+
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir) / "workspace" / "dupefinder"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    bad_test = """
+import unittest, subprocess, sys
+from pathlib import Path
+TOOL_PATH = Path(__file__).resolve().parent / 'dupefinder.py'
+class TestDupe(unittest.TestCase):
+    def test_json_bracket(self):
+        res = subprocess.run([sys.executable, str(TOOL_PATH), '--help'], capture_output=True, text=True, encoding='utf-8')
+        self.assertIn("['folder']", res.stdout)
+if __name__ == '__main__':
+    unittest.main()
+"""
+    broken_tool = "# Stub tool that should be rejected\nimport sys\n"
+    responses = [
+        {"content": f"```python\n{good_tool}\n```"},
+        {"content": f"```python\n{bad_test}\n```"},
+        {"content": f"```python\n# FILE: dupefinder.py\n{broken_tool}\n```"},
+    ]
+    client = MockChatClient(responses)
+    engine = CoreEngine(client=client)
+
+    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
+        success, msg, details = build_standalone_project_staged(
+            engine,
+            "Build me a command-line tool called dupefinder. It needs a --json option.",
+            max_attempts=2,
+        )
+        tool_content = (proj_dir / "dupefinder.py").read_text(encoding="utf-8")
+        assert "Stub tool that should be rejected" not in tool_content
+        assert "args = parser.parse_args()" in tool_content
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r4_hygiene_static_checks_r4_rules() -> None:
+    """R4-2: Static hygiene check rejects short assertNotIn, exact multi-space, and missing json.loads."""
+    from helix_core.quality import check_test_code_hygiene
+
+    # 1. Short assertNotIn (<= 2 chars)
+    code1 = """import unittest
+class T(unittest.TestCase):
+    def test_x(self):
+        self.assertNotIn("a", output)
+"""
+    ok1, issues1 = check_test_code_hygiene(code1, "testtool")
+    assert not ok1
+    assert any("<= 2 chars" in i for i in issues1)
+
+    # 2. Exact multi-space formatting
+    code2 = """import unittest
+class T(unittest.TestCase):
+    def test_x(self):
+        self.assertEqual(output, "Name     Age    City")
+"""
+    ok2, issues2 = check_test_code_hygiene(code2, "testtool")
+    assert not ok2
+    assert any("multi-space" in i for i in issues2)
+
+    # 3. Missing json.loads when testing --json
+    code3 = """import unittest
+class T(unittest.TestCase):
+    def test_x(self):
+        res = run([sys.executable, str(TOOL_PATH), "--json"])
+        self.assertIn("foo", res.stdout)
+"""
+    ok3, issues3 = check_test_code_hygiene(code3, "testtool")
+    assert not ok3
+    assert any("json.loads" in i for i in issues3)
+
+    # 4. Clean test adhering to rules passes
+    code4 = """import unittest
+import json
+class T(unittest.TestCase):
+    def test_x(self):
+        res = run([sys.executable, str(TOOL_PATH), "--json"])
+        data = json.loads(res.stdout)
+        self.assertEqual(data["count"], 0)
+        self.assertNotIn("unwanted_token", res.stdout)
+"""
+    ok4, issues4 = check_test_code_hygiene(code4, "testtool")
+    assert ok4
+    assert len(issues4) == 0
+
+
+def test_r4_memory_gate_budget_enforcement() -> None:
+    """R4-4: Memory budget gate rejects full file reads and enforces memory ceiling."""
+    from helix_core.quality import check_requirements_coverage
+
+    bad_code = """import sys
+def main():
+    data = open('bigfile.bin').read()
+"""
+    covered, missing = check_requirements_coverage("tool to process big files", bad_code)
+    assert not covered
+    assert any("full-file read" in m for m in missing)
+
+
+def test_r4_quarantine_bad_test_and_skipped_status() -> None:
+    """R4-3: Quarantines bad test with @unittest.skip and outputs accurate final status."""
+    import tempfile, shutil
+    from helix_core.standalone_builder import build_standalone_project_staged
+
+    good_tool = """
+import sys, os, argparse
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+parser = argparse.ArgumentParser()
+parser.add_argument('file')
+parser.add_argument('--json', action='store_true')
+args = parser.parse_args()
+if not os.path.exists(args.file):
+    print("error", file=sys.stderr)
+    sys.exit(1)
+print("ok")
+"""
+    bad_output_test = """
+import unittest, subprocess, sys
+from pathlib import Path
+TOOL_PATH = Path(__file__).resolve().parent / 'dupefinder.py'
+
+class TestDupe(unittest.TestCase):
+    def test_rigid_bad_assertion(self):
+        res = subprocess.run([sys.executable, str(TOOL_PATH), '--help'], capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(res.stdout, "THIS RIGID STRING CONTRADICTS OBSERVED SMOKE OUTPUT")
+    def test_valid_runs(self):
+        res = subprocess.run([sys.executable, str(TOOL_PATH), '--help'], capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(res.returncode, 0)
+if __name__ == '__main__':
+    unittest.main()
+"""
+    responses = [
+        {"content": f"```python\n{good_tool}\n```"},
+        {"content": f"```python\n{bad_output_test}\n```"},
+    ]
+    client = MockChatClient(responses)
+    engine = CoreEngine(client=client)
+
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir) / "workspace" / "dupefinder"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
+        success, msg, details = build_standalone_project_staged(
+            engine,
+            "Build me a command-line tool called dupefinder. It needs a --json option.",
+            max_attempts=1,
+        )
+        assert "tool meets requirements; 1 of my tests were wrong and skipped: test_rigid_bad_assertion" in details["status"]
+        test_file_content = (proj_dir / "test_dupefinder.py").read_text(encoding="utf-8")
+        assert "@unittest.skip" in test_file_content
+        assert "test_rigid_bad_assertion" in test_file_content
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+# -----------------------------------------------------------------------------
+# Round 5 Fixes Tests
+# -----------------------------------------------------------------------------
+
+def test_r5_table_alignment_under_max_width_smoke_check() -> None:
+    """R5-2: Deterministic smoke test detects misaligned table rows under --max-width."""
+    from helix_core.standalone_builder import run_smoke_tests
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir)
+    bad_tab = proj_dir / "tablefmt.py"
+    bad_code = """import sys, os, argparse
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+parser = argparse.ArgumentParser()
+parser.add_argument('csv_file')
+parser.add_argument('--max-width', type=int, default=8)
+args = parser.parse_args()
+if not os.path.exists(args.csv_file):
+    sys.exit(1)
+print("id | name    | department")
+print("---+---------+-----------")
+print("1  | LongNameWasNotTruncated | Engineering")
+print("2  | AnotherVeryLongName     | HR")
+"""
+    bad_tab.write_text(bad_code, encoding="utf-8")
+    ok, rep, fails = run_smoke_tests(proj_dir, bad_tab, "tablefmt", "Build tablefmt with --max-width", timeout=10.0)
+    assert not ok, "Smoke tests must fail when table rows are misaligned"
+    assert any("Table alignment error" in f or "Table column alignment" in f for f in fails)
+
+    good_code = """import sys, os, argparse
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+parser = argparse.ArgumentParser()
+parser.add_argument('csv_file')
+parser.add_argument('--max-width', type=int, default=8)
+args = parser.parse_args()
+if not os.path.exists(args.csv_file):
+    sys.exit(1)
+print("id | name     | depart..")
+print("---+----------+---------")
+print("1  | Short    | Engine..")
+print("2  | VeryLo.. | HR      ")
+"""
+    bad_tab.write_text(good_code, encoding="utf-8")
+    ok2, rep2, fails2 = run_smoke_tests(proj_dir, bad_tab, "tablefmt", "Build tablefmt with --max-width", timeout=10.0)
+    assert ok2, f"Expected smoke test to pass on aligned table: {fails2}"
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r5_whole_document_tool_relaxed_advisory_budget() -> None:
+    """R5-1: Whole-document tools (JSON/XML/YAML) receive relaxed advisory memory budget."""
+    from helix_core.quality import classify_tool_input_kind, check_tool_memory_budget
+    assert classify_tool_input_kind("Build tool jsonget for json file", "jsonget") == "whole_document_json"
+    assert classify_tool_input_kind("Build tool tabprint for csv file", "tabprint") == "streaming_csv"
+    assert classify_tool_input_kind("Build tool dirsize for directory", "dirsize") == "streaming_directory"
+
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir)
+    tool_file = proj_dir / "jsonget.py"
+    tool_file.write_text("""import sys, json, os
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    print("loaded")
+""", encoding="utf-8")
+
+    ok, rss, rep = check_tool_memory_budget(proj_dir, tool_file, "jsonget", request="Build me tool jsonget for json file", timeout=15.0)
+    assert ok is True
+    assert "Advisory" in rep or "PASSED" in rep
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r5_identical_regeneration_loop_guard() -> None:
+    """R5-1: Loop guard breaks early when model regenerates identical code with same failures."""
+    from helix_core.standalone_builder import build_standalone_project_staged
+    from helix_core.engine import CoreEngine
+
+    identical_tool = """```python
+import sys, argparse
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+parser = argparse.ArgumentParser()
+parser.add_argument('path')
+parser.add_argument('--flag', action='store_true')
+args = parser.parse_args()
+print("tool output")
+```"""
+    failing_test = """```python
+import unittest, subprocess, sys
+from pathlib import Path
+TOOL_PATH = Path(__file__).resolve().parent / 'looptool.py'
+class T(unittest.TestCase):
+    def test_fail(self):
+        self.assertEqual(1, 2)
+if __name__ == '__main__':
+    unittest.main()
+```"""
+    responses = [
+        {"content": identical_tool},
+        {"content": failing_test},
+        {"content": identical_tool},
+        {"content": identical_tool},
+        {"content": identical_tool},
+    ]
+    client = MockChatClient(responses)
+    engine = CoreEngine(client=client)
+
+    test_dir = tempfile.mkdtemp()
+    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
+        success, msg, details = build_standalone_project_staged(
+            engine,
+            "Build me a command-line tool called looptool with --flag option",
+            max_attempts=5,
+        )
+        assert success is False
+        assert details["attempts"] <= 3, f"Loop guard should halt at attempt <= 3, but took {details['attempts']}"
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r5_status_wording_matches_facts_on_disk() -> None:
+    """R5-3 & R5-5: Final status wording is derived from facts on disk and matches defined table."""
+    from helix_core.quality import compute_final_status_from_disk
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir)
+
+    st1 = compute_final_status_from_disk(proj_dir, "missing_tool")
+    assert st1 == "REQUIREMENT FAILED (tool source file not found on disk)"
+
+    (proj_dir / "sample.py").write_text("import sys, argparse\nif sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')\nparser = argparse.ArgumentParser()\nparser.add_argument('file')\nparser.add_argument('--json', action='store_true')\nargs = parser.parse_args()\nimport os\nif not os.path.exists(args.file): sys.exit(1)\nprint('done')\n", encoding="utf-8")
+    st2 = compute_final_status_from_disk(proj_dir, "sample", "Build me a tool called sample with --json")
+    assert st2 == "NO TESTS GENERATED (test file missing on disk)"
+
+    (proj_dir / "test_sample.py").write_text("""import unittest
+class T(unittest.TestCase):
+    def test_a(self): pass
+    def test_b(self): pass
+if __name__ == '__main__':
+    unittest.main()
+""", encoding="utf-8")
+    st3 = compute_final_status_from_disk(proj_dir, "sample", "Build me a tool called sample with --json")
+    assert st3.startswith("COVERAGE GAP (missing active test coverage for: --json)"), f"Actual: {st3}"
+
+    (proj_dir / "test_sample.py").write_text("""import unittest, subprocess, sys
+from pathlib import Path
+TOOL_PATH = Path(__file__).resolve().parent / 'sample.py'
+class T(unittest.TestCase):
+    def test_json(self):
+        res = subprocess.run([sys.executable, str(TOOL_PATH), '--help'], capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(res.returncode, 0)
+    @unittest.skip("skip reason")
+    def test_b(self): pass
+if __name__ == '__main__':
+    unittest.main()
+""", encoding="utf-8")
+    st4 = compute_final_status_from_disk(proj_dir, "sample", "Build me a tool called sample with --json")
+    assert st4.startswith("PASSED WITH SKIPS (1 active passed, 1 skipped: test_b)"), f"Actual: {st4}"
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r5_quarantine_rewrite_before_skip_and_cap() -> None:
+    """R5-3: Rewriting is tried before skipping, 25% cap enforced, and sole option tests protected."""
+    from helix_core.quality import quarantine_bad_tests
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir)
+    test_path = proj_dir / "test_dirsize.py"
+
+    suite_code = """import unittest, subprocess, sys
+from pathlib import Path
+TOOL_PATH = Path(__file__).resolve().parent / 'dirsize.py'
+class T(unittest.TestCase):
+    def test_1(self): pass
+    def test_2(self): pass
+    def test_3(self): pass
+    def test_4(self): pass
+    def test_5(self): pass
+    def test_6(self): pass
+    def test_top_option(self):
+        res = subprocess.run([sys.executable, str(TOOL_PATH), '--top', '5'], capture_output=True, text=True)
+        self.assertEqual(res.stdout, "rigid --top")
+    def test_rigid_format(self):
+        res = subprocess.run([sys.executable, str(TOOL_PATH)], capture_output=True, text=True)
+        self.assertEqual(res.stdout, "rigid    spacing")
+"""
+    test_path.write_text(suite_code, encoding="utf-8")
+
+    ok, qlist = quarantine_bad_tests(proj_dir, test_path, ["test_top_option", "test_rigid_format"], "AssertionError: rigid    spacing != other", request="tool with --top option")
+    qnames = [q["name"] for q in qlist]
+    assert "test_top_option" not in qnames, "Sole test for requested option --top must NOT be quarantined"
+    assert "test_rigid_format" in qnames
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r5_arbitration_treats_requested_option_failure_as_tool_defect() -> None:
+    """R5-5: Arbitration treats test failures on requested options as TOOL defects."""
+    from helix_core.quality import arbitrate_test_failure
+
+    test_src = """
+def test_keys_option(self):
+    res = subprocess.run([sys.executable, str(TOOL_PATH), 'f.json', '--keys'], capture_output=True, text=True)
+    self.assertIn('name', res.stdout)
+"""
+    arb = arbitrate_test_failure(
+        request="Build tool jsonget with --keys option",
+        tool_code="print('no keys')",
+        test_code=test_src,
+        test_output="AssertionError: 'name' not found in ''",
+        failing_tests=["test_keys_option"],
+        smoke_passed=True,
+        coverage_passed=True,
+        memory_passed=True,
+    )
+    assert arb["classification"] == "TOOL", "Failure asserting requested option must be classified as TOOL defect"
+    assert arb["lock_tool"] is False, "Tool must not be locked when fixing requested option defect"
+
+
+def test_r5_coverage_gap_status_when_option_uncovered() -> None:
+    """R5-3: If requested option lacks active tests, status reports COVERAGE GAP."""
+    from helix_core.quality import compute_final_status_from_disk
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir)
+    (proj_dir / "mytool.py").write_text("import sys, argparse\nif sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')\nparser = argparse.ArgumentParser()\nparser.add_argument('file')\nparser.add_argument('--pretty', action='store_true')\nargs = parser.parse_args()\nimport os\nif not os.path.exists(args.file): sys.exit(1)\n", encoding="utf-8")
+    (proj_dir / "test_mytool.py").write_text("""import unittest
+class T(unittest.TestCase):
+    def test_basic(self): pass
+if __name__ == '__main__': unittest.main()
+""", encoding="utf-8")
+
+    st = compute_final_status_from_disk(proj_dir, "mytool", "Build me a tool called mytool with --pretty option")
+    assert st.startswith("COVERAGE GAP (missing active test coverage for: --pretty)"), f"Unexpected status: {st}"
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
 # -----------------------------------------------------------------------------
 # Runner
 # -----------------------------------------------------------------------------
@@ -1039,6 +1619,20 @@ def run_all_dev_fix_tests() -> bool:
         ("R3: Regression Rollback to Best-So-Far", test_r3_regression_rollback_to_best_so_far),
         ("R3: Test Hygiene Static Check", test_r3_test_hygiene_static_check),
         ("R3: Honesty Guard Legitimate Failure Preserved", test_r3_honesty_guard_legitimate_failure_not_rewritten),
+        ("R4: Timeout in Test Stage Preserves Tool", test_r4_timeout_in_test_stage_preserves_tool),
+        ("R4: All Attempts Timeout Truthful Failure", test_r4_all_attempts_timeout_truthfully_reports_files),
+        ("R4: Timeout in Fix Stage Preserves Files", test_r4_timeout_in_fix_stage_preserves_files),
+        ("R4: Arbitration Locks Tool SHA on Test Defect", test_r4_arbitration_locks_tool_sha_on_test_defect),
+        ("R4: Hygiene Static Checks R4 Rules", test_r4_hygiene_static_checks_r4_rules),
+        ("R4: Memory Gate Budget Enforcement", test_r4_memory_gate_budget_enforcement),
+        ("R4: Quarantine Bad Test & Skipped Status", test_r4_quarantine_bad_test_and_skipped_status),
+        ("R5: Table Alignment Smoke Check", test_r5_table_alignment_under_max_width_smoke_check),
+        ("R5: Whole Document Advisory Budget", test_r5_whole_document_tool_relaxed_advisory_budget),
+        ("R5: Loop Guard Identical Regeneration", test_r5_identical_regeneration_loop_guard),
+        ("R5: Status Wording Matches Facts on Disk", test_r5_status_wording_matches_facts_on_disk),
+        ("R5: Quarantine Rewrite & 25% Cap", test_r5_quarantine_rewrite_before_skip_and_cap),
+        ("R5: Arbitration Option Guard", test_r5_arbitration_treats_requested_option_failure_as_tool_defect),
+        ("R5: Coverage Gap Status", test_r5_coverage_gap_status_when_option_uncovered),
     ]
 
     print("=" * 60)

@@ -37,6 +37,8 @@ plugins/tests/*
 plugins/quarantine/
 workspace/*
 !workspace/.gitkeep
+.build_log/
+*.build_log
 
 # OS / editor
 Thumbs.db
