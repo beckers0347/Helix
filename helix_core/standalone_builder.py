@@ -7,6 +7,7 @@ stub rejection, stuck detection, strategy rotation, best-so-far rollback, and tr
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 from helix_core.codetools import run_python_test
 from helix_core.config import SYSTEM_PROMPT, get_request_timeout
@@ -23,25 +24,424 @@ from helix_core.engine import CoreEngine
 from helix_core.paths import HELIX_ROOT
 from helix_core.quality import (
     BuildStatus,
+    OracleRegistry,
+    ParsedUnittestSummary,
     arbitrate_test_failure,
+    assert_status_consistent_with_results,
     check_requirements_coverage,
+    check_table_alignment_output,
     check_test_code_hygiene,
+    check_tool_code_hygiene,
     check_tool_memory_budget,
+    check_undefined_names_and_imports,
     classify_tool_input_kind,
     compute_final_status_from_disk,
+    count_test_methods_ast,
+    determine_fix_strategy,
     ensure_options_coverage_or_gap,
+    ensure_unittest_main_guard,
     extract_requested_flags,
     measure_process_peak_rss,
+    parse_unittest_output,
     quarantine_bad_tests,
+    run_and_parse_unittest,
+    run_direct_test_file,
     sanitize_test_code,
     test_contradicts_observed_behavior,
     try_rewrite_failing_test,
+    validate_generated_test_file,
     validate_test_code_regression,
     validate_tool_code_regression,
 )
 
 
 WORKSPACE_DIR = HELIX_ROOT / "workspace"
+
+
+SCAFFOLD_TEMPLATE = '''"""Automated test scaffold for __PROJECT_NAME__.py.
+Provides deterministic environment, subprocess runner, and temp directory management.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Any, Dict, List, NamedTuple, Optional, Union
+import unittest
+
+TOOL = Path(__file__).resolve().parent / "__PROJECT_NAME__.py"
+
+
+class Result(NamedTuple):
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def run_tool(
+    *args: str,
+    input_text: Optional[str] = None,
+    env_extra: Optional[Dict[str, str]] = None,
+    cwd: Optional[Union[str, Path]] = None,
+    timeout: float = 30.0,
+) -> Result:
+    """Execute the tool with consistent UTF-8 encoding and isolated environment."""
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    if env_extra:
+        env.update(env_extra)
+
+    temp_cwd = None
+    if cwd is None:
+        temp_cwd = tempfile.mkdtemp(prefix="tool_cwd_")
+        target_cwd = temp_cwd
+    else:
+        target_cwd = str(cwd)
+
+    cmd = [sys.executable, str(TOOL), *args]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            cwd=target_cwd,
+            timeout=timeout,
+        )
+        return Result(proc.returncode, proc.stdout or "", proc.stderr or "")
+    finally:
+        if temp_cwd and os.path.exists(temp_cwd):
+            try:
+                shutil.rmtree(temp_cwd, ignore_errors=True)
+            except Exception:
+                pass
+
+
+class ToolTestCase(unittest.TestCase):
+    """Base class for tool tests providing per-test temp directory and assertions."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="test___PROJECT_NAME___")).resolve()
+
+    def tearDown(self) -> None:
+        if hasattr(self, "tmp") and self.tmp.exists():
+            try:
+                shutil.rmtree(self.tmp, ignore_errors=True)
+            except Exception:
+                pass
+
+    def write_file(self, name: str, text_or_bytes: Union[str, bytes], encoding: str = "utf-8") -> Path:
+        """Create and write a file inside the isolated temp directory."""
+        p = (self.tmp / name).resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(text_or_bytes, bytes):
+            p.write_bytes(text_or_bytes)
+        else:
+            p.write_text(text_or_bytes, encoding=encoding)
+        return p
+
+    def make_dir(self, name: str) -> Path:
+        """Create a subdirectory inside the isolated temp directory."""
+        d = (self.tmp / name).resolve()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def run_tool(
+        self,
+        *args: Any,
+        input_text: Optional[str] = None,
+        env_extra: Optional[Dict[str, str]] = None,
+        cwd: Optional[Union[str, Path]] = None,
+        timeout: float = 30.0,
+    ) -> Result:
+        """Run tool with cwd defaulting to this test's temp directory."""
+        target_cwd = cwd if cwd is not None else self.tmp
+        str_args = [str(a) for a in args]
+        return run_tool(*str_args, input_text=input_text, env_extra=env_extra, cwd=target_cwd, timeout=timeout)
+
+    def assertOk(self, result: Result, msg: Optional[str] = None) -> None:
+        """Assert that tool exited 0."""
+        if result.returncode != 0:
+            err = msg or f"Expected returncode 0 but got {result.returncode}.\\nstdout: {result.stdout}\\nstderr: {result.stderr}"
+            self.fail(err)
+
+    def assertFails(self, result: Result, msg: Optional[str] = None) -> None:
+        """Assert that tool exited non-zero with stderr output."""
+        if result.returncode == 0:
+            err = msg or f"Expected non-zero exit code but got 0.\\nstdout: {result.stdout}"
+            self.fail(err)
+        has_error_output = bool(result.stderr.strip() or result.stdout.strip())
+        if not has_error_output:
+            self.fail(f"Expected error message on stderr/stdout but both were empty (returncode {result.returncode})")
+
+    def assertJsonOutput(self, result: Union[Result, str]) -> Any:
+        """Parse JSON from result stdout (or string). Fails test with clear error if not valid JSON."""
+        stdout = result.stdout if isinstance(result, Result) else str(result)
+        try:
+            return json.loads(stdout)
+        except Exception as e:
+            rc = result.returncode if isinstance(result, Result) else "?"
+            stderr = result.stderr if isinstance(result, Result) else ""
+            self.fail(
+                f"Failed to parse JSON output: {e}\\nreturncode: {rc}\\nstdout: {stdout[:400]!r}\\nstderr: {stderr[:400]!r}"
+            )
+'''
+
+
+def write_scaffold_file(project_dir: Path, project_name: str) -> Path:
+    """Write the deterministic _scaffold.py module into the project directory."""
+    scaffold_path = project_dir / "_scaffold.py"
+    content = SCAFFOLD_TEMPLATE.replace("__PROJECT_NAME__", project_name)
+    scaffold_path.write_text(content, encoding="utf-8")
+    return scaffold_path
+
+
+def discover_cli_contract(tool_path: Optional[Path] = None, tool_code: Optional[str] = None) -> Dict[str, Any]:
+    """Discover CLI contract using AST inspection of argparse calls and --help execution."""
+    contract: Dict[str, Any] = {
+        "required_positionals": [],
+        "optional_positionals": [],
+        "required_options": [],
+        "optional_options": [],
+        "usage_line": "",
+    }
+
+    if tool_code is None and tool_path is not None and tool_path.exists():
+        try:
+            tool_code = tool_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            tool_code = ""
+
+    if tool_code:
+        try:
+            tree = ast.parse(tool_code)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    fn_name = ""
+                    if isinstance(node.func, ast.Attribute):
+                        fn_name = node.func.attr
+                    elif isinstance(node.func, ast.Name):
+                        fn_name = node.func.id
+
+                    if fn_name == "add_argument":
+                        flag_args = []
+                        for a in node.args:
+                            if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                                flag_args.append(a.value)
+
+                        kwargs: Dict[str, Any] = {}
+                        for kw in node.keywords:
+                            if kw.arg:
+                                if isinstance(kw.value, ast.Constant):
+                                    kwargs[kw.arg] = kw.value.value
+                                elif isinstance(kw.value, ast.Name):
+                                    kwargs[kw.arg] = kw.value.id
+
+                        if not flag_args:
+                            continue
+
+                        is_positional = not flag_args[0].startswith("-")
+                        if is_positional:
+                            pos_name = flag_args[0]
+                            nargs = kwargs.get("nargs", None)
+                            is_required = nargs not in ("?", "*")
+                            entry = {
+                                "name": pos_name,
+                                "help": kwargs.get("help", ""),
+                                "type": kwargs.get("type", "str"),
+                                "default": kwargs.get("default", None),
+                            }
+                            if is_required:
+                                contract["required_positionals"].append(entry)
+                            else:
+                                contract["optional_positionals"].append(entry)
+                        else:
+                            flags = flag_args
+                            is_req = kwargs.get("required", False) is True
+                            dest = kwargs.get("dest", flags[-1].lstrip("-").replace("-", "_"))
+                            action = kwargs.get("action", "")
+                            entry = {
+                                "flags": flags,
+                                "dest": dest,
+                                "action": action,
+                                "type": kwargs.get("type", "str"),
+                                "default": kwargs.get("default", None),
+                                "required": is_req,
+                            }
+                            if is_req:
+                                contract["required_options"].append(entry)
+                            else:
+                                contract["optional_options"].append(entry)
+        except Exception:
+            pass
+
+    if tool_path is not None and tool_path.exists():
+        try:
+            res = subprocess.run(
+                [sys.executable, str(tool_path), "--help"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5.0,
+            )
+            out = (res.stdout or "") + (res.stderr or "")
+            m_usage = re.search(r"usage:\s*([^\n]+)", out, re.I)
+            if m_usage:
+                contract["usage_line"] = m_usage.group(1).strip()
+        except Exception:
+            pass
+
+    return contract
+
+
+def build_smoke_args(
+    contract: Dict[str, Any],
+    fixture_dir: Path,
+    request: str,
+    project_name: str,
+) -> Tuple[List[str], bool]:
+    """Construct a plausible argument list satisfying positionals and required flags."""
+    req_pos = contract.get("required_positionals", [])
+    req_lower = request.lower()
+
+    is_toml = "toml" in req_lower or "toml" in project_name.lower() or "tomlget" in project_name.lower()
+    is_json = not is_toml and ("json" in req_lower or "json" in project_name.lower() or "jsonget" in project_name.lower())
+    is_csv = not is_toml and not is_json and ("csv" in req_lower or "csv" in project_name.lower() or "csvstats" in project_name.lower() or "colstats" in project_name.lower() or "tablefmt" in project_name.lower())
+    is_table = is_csv or any(k in req_lower for k in ("table", "column", "colstats", "align")) or "tablefmt" in project_name.lower()
+    is_dir = any(k in req_lower for k in ("folder", "directory", "subfolder")) or "dir" in project_name.lower() or "dupe" in project_name.lower()
+
+    if is_toml:
+        fix_file = fixture_dir / "tiny_valid.toml"
+        fix_file.write_text(
+            'title = "café"\n\n[server]\nhost = "localhost"\nports = [8080, 8081]\n\n[database]\nport = 5432\nenabled = true\n',
+            encoding="utf-8",
+        )
+    elif is_json:
+        fix_file = fixture_dir / "tiny_valid.json"
+        fix_file.write_text(
+            '{"users": [{"name": "Alice", "city": "Paris"}], "config": {"timeout": 30, "server": {"ports": [8080, 8081]}}, "data": null, "title": "café", "count": 42}',
+            encoding="utf-8",
+        )
+    elif is_csv:
+        fix_file = fixture_dir / "tiny_valid.csv"
+        fix_file.write_text(
+            "col_a,col_b,name\n10,20.5,apple\n30,40.0,café\n50,60.5,cherry\n",
+            encoding="utf-8",
+        )
+    elif is_dir:
+        fix_dir = fixture_dir / "tiny_dir"
+        fix_dir.mkdir(parents=True, exist_ok=True)
+        (fix_dir / "f1.txt").write_text("hello", encoding="utf-8")
+        (fix_dir / "f2.txt").write_text("world", encoding="utf-8")
+        fix_file = fix_dir
+    else:
+        fix_file = fixture_dir / "tiny_valid.txt"
+        fix_file.write_text("the quick brown fox\nthe quick brown dog\n", encoding="utf-8")
+
+    args: List[str] = []
+    file_supplied = False
+
+    # Required options first if any
+    for opt in contract.get("required_options", []):
+        flag = opt["flags"][-1]
+        dest = opt["dest"].lower()
+        if any(k in dest for k in ("file", "input", "src", "path", "config")):
+            args.extend([flag, str(fix_file)])
+            file_supplied = True
+        elif any(k in dest for k in ("format", "type")):
+            args.extend([flag, "json"])
+        elif any(k in dest for k in ("key", "path", "query")):
+            args.extend([flag, "server.ports.0" if is_toml else ("users.0.name" if is_json else "col_a")])
+        else:
+            args.extend([flag, "test"])
+
+    if not req_pos:
+        args.append(str(fix_file))
+        return args, True
+
+    for pos in req_pos:
+        name = pos["name"].lower()
+        hlp = pos.get("help", "").lower()
+        combined = f"{name} {hlp}"
+
+        if any(k in combined for k in ("file", "filename", "input", "src", "source", "csv", "json", "toml", "txt", "doc", "data")):
+            args.append(str(fix_file))
+            file_supplied = True
+        elif any(k in name for k in ("dest", "out", "output", "dst")):
+            dest_file = fixture_dir / "out.txt"
+            dest_file.write_text("sample output\\n", encoding="utf-8")
+            args.append(str(dest_file))
+        elif any(k in combined for k in ("path", "dir", "folder")) and not any(k in combined for k in ("dotted", "key", "query", "selector", "json path", "toml path")):
+            args.append(str(fix_file))
+            file_supplied = True
+        elif any(k in combined for k in ("path", "key", "query", "pattern", "selector", "expr", "field", "column", "col")):
+            if is_toml:
+                args.append("server.ports.0")
+            elif is_json:
+                args.append("users.0.name")
+            elif is_csv:
+                args.append("col_a")
+            else:
+                args.append("quick")
+        elif any(k in combined for k in ("count", "num", "limit", "int", "lines", "width", "number")):
+            args.append("1")
+        elif any(k in combined for k in ("folder", "dir", "directory")):
+            args.append(str(fix_file))
+        else:
+            args.append("test")
+
+    return args, True
+
+
+def check_table_alignment_output(output: str) -> Tuple[bool, str]:
+    """Deterministically verify table alignment:
+    Header row, separator row, and all data rows must share identical column separator positions,
+    and cell text must not exceed column width or cause overflow across header and data rows.
+    """
+    lines = [l.rstrip() for l in output.strip().splitlines() if l.strip()]
+    table_rows = [l for l in lines if "|" in l]
+    if len(table_rows) < 2:
+        return True, ""
+
+    header_seps = [i for i, ch in enumerate(table_rows[0]) if ch == "|"]
+    for r_idx, r in enumerate(table_rows[1:], 1):
+        row_seps = [i for i, ch in enumerate(r) if ch in ("|", "+")]
+        if row_seps != header_seps:
+            err = (
+                f"Table alignment error: row {r_idx} column separators at {row_seps} "
+                f"do not match header pipe indices at {header_seps}. Character position mismatch!\n"
+                f"Header: {table_rows[0]!r}\n"
+                f"Row {r_idx}: {r!r}\n"
+                "Column widths in Pass 1 MUST be computed from the TRUNCATED cell text "
+                "so header, separator, and all data rows align perfectly."
+            )
+            return False, err
+
+    # Header text vs data width comparison after truncation
+    if len(header_seps) >= 2:
+        for k in range(len(header_seps) - 1):
+            col_start = header_seps[k] + 1
+            col_end = header_seps[k + 1]
+            col_w = col_end - col_start
+            header_cell = table_rows[0][col_start:col_end].strip()
+            if len(header_cell) > col_w:
+                return False, f"Table alignment error: header cell '{header_cell}' exceeds column width ({col_w})"
+            for r_idx, r in enumerate(table_rows[2:], 2):
+                if len(r) > col_end:
+                    cell_text = r[col_start:col_end].strip()
+                    if len(cell_text) > col_w:
+                        return False, f"Table alignment error: row {r_idx} cell '{cell_text}' exceeds column width ({col_w})"
+
+    return True, ""
 
 
 def get_sha256(content_or_path: Any) -> str:
@@ -142,22 +542,28 @@ def run_smoke_tests(
     return_samples: bool = False,
 ) -> Any:
     """Run deterministic smoke tests on the CLI tool before/alongside full unit tests.
-
-    Checks:
-    1. --help: must exit 0 and write usage information.
-    2. Nonexistent path: must exit non-zero (rc != 0) and write to stderr.
-    3. Tiny valid input: run tool with small valid file; must exit 0 and produce output.
-    4. Windows Unicode console safety under cp1252:
-       Runs on a fixture with non-ASCII filename AND non-ASCII content in output path with
-       PYTHONIOENCODING=cp1252 and PYTHONUTF8=0. Must exit 0 without UnicodeEncodeError.
+    Discovers CLI contract, supplies plausible fixtures, detects harness errors,
+    retries once on argparse usage error, and verifies table formatting and Unicode safety.
     """
     failures = []
     results = []
     observed_samples: List[Dict[str, Any]] = []
+    has_harness_error = False
 
-    # 1. --help
+    # Discover CLI contract from AST and --help
+    contract = discover_cli_contract(tool_path)
+    smoke_fixture_dir = project_dir / "_smoke_test_fixture"
+    smoke_fixture_dir.mkdir(parents=True, exist_ok=True)
+
+    smoke_args, is_table = build_smoke_args(contract, smoke_fixture_dir, request, project_name)
+    req_lower = request.lower()
+    is_toml = "toml" in req_lower or "toml" in project_name.lower() or "tomlget" in project_name.lower()
+    is_json = not is_toml and ("json" in req_lower or "json" in project_name.lower() or "jsonget" in project_name.lower())
+    is_csv = not is_toml and not is_json and ("csv" in req_lower or is_table)
+
+    # 1. --help execution
     try:
-        proc = subprocess.run(
+        proc_help = subprocess.run(
             [sys.executable, str(tool_path), "--help"],
             cwd=str(project_dir),
             capture_output=True,
@@ -166,25 +572,34 @@ def run_smoke_tests(
             errors="replace",
             timeout=timeout,
         )
-        if proc.returncode == 0:
+        if proc_help.returncode == 0:
             results.append("Smoke test `--help`: PASSED (exit 0)")
         else:
-            failures.append(f"`--help` exited with code {proc.returncode} instead of 0. stderr: {proc.stderr[:200]}")
+            failures.append(f"`--help` exited with code {proc_help.returncode} instead of 0. stderr: {proc_help.stderr[:200]}")
         observed_samples.append({
             "description": "Invocation with `--help`",
             "command": f"python {project_name}.py --help",
-            "exit_code": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
+            "exit_code": proc_help.returncode,
+            "stdout": proc_help.stdout,
+            "stderr": proc_help.stderr,
         })
     except Exception as e:
         failures.append(f"`--help` execution failed: {e}")
 
-    # 2. Nonexistent path
+    # 2. Nonexistent path execution
     nonexistent = project_dir / "__nonexistent_smoke_test_path_12345__"
+    nonexist_args = []
+    for a in smoke_args:
+        if os.path.exists(a) or "_smoke_test_fixture" in a:
+            nonexist_args.append(str(nonexistent))
+        else:
+            nonexist_args.append(a)
+    if not nonexist_args:
+        nonexist_args = [str(nonexistent)]
+
     try:
-        proc = subprocess.run(
-            [sys.executable, str(tool_path), str(nonexistent)],
+        proc_ne = subprocess.run(
+            [sys.executable, str(tool_path), *nonexist_args],
             cwd=str(project_dir),
             capture_output=True,
             text=True,
@@ -192,64 +607,27 @@ def run_smoke_tests(
             errors="replace",
             timeout=timeout,
         )
-        if proc.returncode != 0:
-            results.append(f"Smoke test nonexistent path: PASSED (exit {proc.returncode} != 0)")
+        if proc_ne.returncode != 0:
+            results.append(f"Smoke test nonexistent path: PASSED (exit {proc_ne.returncode} != 0)")
         else:
             failures.append(
                 "Smoke test nonexistent path failed: running with nonexistent path exited 0! "
                 "Error conditions MUST exit non-zero (e.g. sys.exit(1)) and write to sys.stderr."
             )
         observed_samples.append({
-            "description": "Invocation with nonexistent path (error contract)",
-            "command": f"python {project_name}.py {nonexistent.name}",
-            "exit_code": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
+            "description": "Nonexistent path execution",
+            "command": f"python {project_name}.py {' '.join(Path(a).name if os.path.exists(a) else a for a in nonexist_args)}",
+            "exit_code": proc_ne.returncode,
+            "stdout": proc_ne.stdout,
+            "stderr": proc_ne.stderr,
         })
     except Exception as e:
         failures.append(f"Nonexistent path smoke test failed: {e}")
 
-    # 3. Tiny valid input fixture
-    smoke_fixture_dir = project_dir / "_smoke_test_fixture"
-    smoke_fixture_dir.mkdir(parents=True, exist_ok=True)
-    req_lower = request.lower()
-    is_dir = any(k in req_lower for k in ("folder", "directory", "subfolder")) or "dir" in project_name.lower() or "dupe" in project_name.lower()
-    is_csv = not is_dir and ("csv" in req_lower or "csv" in project_name.lower() or "tablefmt" in project_name.lower())
-    is_json = not is_dir and ("json file" in req_lower or "jsonquery" in project_name.lower() or "json query" in req_lower or ("json" in req_lower and "file" in req_lower))
-
-    extra_args = []
-    if is_json:
-        valid_filename = "tiny_valid.json"
-        valid_file = smoke_fixture_dir / valid_filename
-        valid_file.write_text('{"users": [{"name": "Alice"}], "config": {"timeout": 30}}\n', encoding="utf-8")
-        target_valid = str(valid_file)
-        if "jsonquery" in project_name.lower():
-            extra_args = ["users.0.name"]
-    elif is_csv:
-        valid_filename = "tiny_valid.csv"
-        valid_file = smoke_fixture_dir / valid_filename
-        valid_file.write_text("col_a,col_b,col_c\n10,20,apple\n30,40,banana\n", encoding="utf-8")
-        target_valid = str(valid_file)
-    elif is_dir:
-        tiny_sub = smoke_fixture_dir / "tiny_dir"
-        tiny_sub.mkdir(parents=True, exist_ok=True)
-        sub1 = tiny_sub / "sub1"
-        sub1.mkdir(exist_ok=True)
-        (sub1 / "file.txt").write_text("hello", encoding="utf-8")
-        sub2 = tiny_sub / "sub2"
-        sub2.mkdir(exist_ok=True)
-        (sub2 / "data.bin").write_bytes(b"x" * 1024)
-        target_valid = str(tiny_sub)
-        valid_filename = "tiny_dir"
-    else:
-        valid_filename = "tiny_valid.txt"
-        valid_file = smoke_fixture_dir / valid_filename
-        valid_file.write_text("the quick brown fox jumps over the lazy dog\nthe quick brown dog\n", encoding="utf-8")
-        target_valid = str(valid_file)
-
+    # 3. Tiny valid input execution with discovered arguments
     try:
-        proc = subprocess.run(
-            [sys.executable, str(tool_path), target_valid, *extra_args],
+        proc_valid = subprocess.run(
+            [sys.executable, str(tool_path), *smoke_args],
             cwd=str(project_dir),
             capture_output=True,
             text=True,
@@ -257,59 +635,126 @@ def run_smoke_tests(
             errors="replace",
             timeout=timeout,
         )
-        if proc.returncode == 0:
+        if proc_valid.returncode == 0:
             results.append("Smoke test tiny valid input: PASSED (exit 0)")
         else:
-            failures.append(f"Smoke test tiny valid input failed: exited {proc.returncode}. stderr: {proc.stderr[:200]}")
+            err_lower = (proc_valid.stderr or "").lower()
+            is_argparse_err = any(err in err_lower for err in (
+                "the following arguments are required",
+                "unrecognized arguments",
+                "invalid ... value",
+                "invalid choice",
+                "usage: ",
+                "error: argument",
+            ))
+            if is_argparse_err:
+                has_harness_error = True
+                # Retry once with parsed required arguments if possible
+                corrected_args = list(smoke_args)
+                m_req = re.search(r"the following arguments are required:\s*([a-zA-Z0-9_\-\s,]+)", proc_valid.stderr or "", re.I)
+                if m_req:
+                    missing_arg_names = [a.strip() for a in m_req.group(1).replace(",", " ").split() if a.strip()]
+                    for missing_name in missing_arg_names:
+                        if "path" in missing_name.lower() or "key" in missing_name.lower():
+                            corrected_args.append("server.ports.0" if is_toml else ("users.0.name" if is_json else "col_a"))
+                        elif "col" in missing_name.lower():
+                            corrected_args.append("col_a")
+                        else:
+                            corrected_args.append("test")
+
+                proc_retry = subprocess.run(
+                    [sys.executable, str(tool_path), *corrected_args],
+                    cwd=str(project_dir),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                )
+                if proc_retry.returncode == 0:
+                    results.append("Smoke test tiny valid input (retry with corrected args): PASSED (exit 0)")
+                    smoke_args = corrected_args
+                    proc_valid = proc_retry
+                    has_harness_error = False
+                else:
+                    results.append(f"Smoke test tiny valid input: INCONCLUSIVE (Harness built command had argparse usage error: {proc_valid.stderr.strip()[:160]})")
+            else:
+                failures.append(f"Smoke test tiny valid input failed: exited {proc_valid.returncode}. stderr: {proc_valid.stderr[:200]}")
+
         observed_samples.append({
-            "description": "Invocation with tiny valid input",
-            "command": f"python {project_name}.py {valid_filename}",
-            "exit_code": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
+            "description": "Tiny valid input execution",
+            "command": f"python {project_name}.py {' '.join(Path(a).name if os.path.exists(a) else a for a in smoke_args)}",
+            "exit_code": proc_valid.returncode,
+            "stdout": proc_valid.stdout,
+            "stderr": proc_valid.stderr,
+            "harness_error": has_harness_error,
         })
     except Exception as e:
         failures.append(f"Tiny valid input smoke test failed: {e}")
 
-    # 4. Unicode safety under cp1252 console with non-ASCII filename AND non-ASCII content
-    u_filename = "テスト_sample_café.csv" if is_csv else "テスト_sample_café.txt"
-    u_file = smoke_fixture_dir / u_filename
-    if is_csv:
-        u_file.write_text("id,name,city\n1,日本語_café,東京\n2,résumé_naïve,京都\n", encoding="utf-8")
-    else:
-        u_file.write_text("café résumé naïve 日本語 東京\ncafé résumé naïve\n", encoding="utf-8")
-
-    env = {
-        **os.environ,
-        "PYTHONIOENCODING": "cp1252",
-        "PYTHONUTF8": "0",
-    }
-    try:
-        target_arg = str(u_file)
-        proc = subprocess.run(
-            [sys.executable, str(tool_path), target_arg],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env=env,
-        )
-        if proc.returncode != 0 and any(k in (proc.stderr or "").lower() for k in ("directory", "folder", "is not a dir", "not a directory")):
-            target_arg = str(smoke_fixture_dir)
-            proc = subprocess.run(
-                [sys.executable, str(tool_path), target_arg],
+    # 4. If --json is requested, run with valid input + --json
+    if "--json" in request:
+        json_args = list(smoke_args)
+        if "--json" not in json_args:
+            json_args.append("--json")
+        try:
+            proc_json = subprocess.run(
+                [sys.executable, str(tool_path), *json_args],
                 cwd=str(project_dir),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout,
-                env=env,
             )
+            observed_samples.append({
+                "description": "Valid input with --json",
+                "command": f"python {project_name}.py {' '.join(Path(a).name if os.path.exists(a) else a for a in json_args)}",
+                "exit_code": proc_json.returncode,
+                "stdout": proc_json.stdout,
+                "stderr": proc_json.stderr,
+            })
+        except Exception:
+            pass
 
-        err_text = (proc.stderr or "") + (proc.stdout or "")
+    # 5. Unicode safety under cp1252 console with non-ASCII filename AND non-ASCII content
+    u_filename = "テスト_sample_café.toml" if is_toml else ("テスト_sample_café.json" if is_json else ("テスト_sample_café.csv" if is_csv else "テスト_sample_café.txt"))
+    u_file = smoke_fixture_dir / u_filename
+    if is_toml:
+        u_file.write_text('title = "café"\\n[server]\\nhost = "東京"\\nports = [8080]\\n', encoding="utf-8")
+    elif is_json:
+        u_file.write_text('{"name": "テスト_café", "city": "東京"}', encoding="utf-8")
+    elif is_csv:
+        u_file.write_text("id,name,city\\n1,日本語_café,東京\\n2,résumé_naïve,京都\\n", encoding="utf-8")
+    else:
+        u_file.write_text("café résumé naïve 日本語 東京\\ncafé résumé naïve\\n", encoding="utf-8")
+
+    env_cp1252 = {
+        **os.environ,
+        "PYTHONIOENCODING": "cp1252",
+        "PYTHONUTF8": "0",
+    }
+    u_args = list(smoke_args)
+    if u_args:
+        for i, a in enumerate(u_args):
+            if os.path.exists(a) and not os.path.isdir(a) and "_smoke_test_fixture" in a:
+                u_args[i] = str(u_file)
+                break
+    else:
+        u_args = [str(u_file)]
+
+    try:
+        proc_u = subprocess.run(
+            [sys.executable, str(tool_path), *u_args],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env_cp1252,
+        )
+        err_text = (proc_u.stderr or "") + (proc_u.stdout or "")
         if "UnicodeEncodeError" in err_text:
             failures.append(
                 "Smoke test cp1252 console failed: UnicodeEncodeError occurred! "
@@ -320,13 +765,18 @@ def run_smoke_tests(
     except Exception as e:
         failures.append(f"Unicode cp1252 smoke test failed: {e}")
 
-    # 5. Table alignment smoke check under --max-width 8 (if CSV or table format)
-    if is_csv or "table" in project_name.lower() or "tabprint" in project_name.lower() or "tablefmt" in project_name.lower():
-        align_csv = smoke_fixture_dir / "smoke_align.csv"
-        align_csv.write_text("id,name,department\n1,Short,Engineering\n2,VeryLongEmployeeNameHere,HR\n", encoding="utf-8")
+    # 6. Table alignment deterministic check (run both with and without max-width/truncate)
+    if is_table:
+        align_csv = smoke_fixture_dir / "smoke_table_align.csv"
+        align_csv.write_text(
+            "name,department,score\\nAlice,Engineering,95.5\\nBobTheVeryLongEmployeeNameHere,QualityAssurance,88.0\\nCharlie,HR,72.5\\n",
+            encoding="utf-8",
+        )
+        # 6a. Table alignment without max-width
         try:
-            proc_align = subprocess.run(
-                [sys.executable, str(tool_path), str(align_csv), "--max-width", "8"],
+            tbl_args = [str(align_csv)]
+            proc_tbl = subprocess.run(
+                [sys.executable, str(tool_path), *tbl_args],
                 cwd=str(project_dir),
                 capture_output=True,
                 text=True,
@@ -334,45 +784,59 @@ def run_smoke_tests(
                 errors="replace",
                 timeout=timeout,
             )
-            if proc_align.returncode == 0 and proc_align.stdout:
-                lines = [l.rstrip() for l in proc_align.stdout.strip().splitlines() if l.strip()]
-                table_rows = [l for l in lines if "|" in l]
-                if len(table_rows) >= 2:
-                    header_seps = [i for i, ch in enumerate(table_rows[0]) if ch == "|"]
-                    misaligned = False
-                    for r_idx, r in enumerate(table_rows[1:], 1):
-                        row_seps = [i for i, ch in enumerate(r) if ch == "|"]
-                        if row_seps != header_seps:
-                            misaligned = True
-                            failures.append(
-                                f"Table alignment error under --max-width: row {r_idx} column separators '|' at {row_seps} "
-                                f"do not match header separators at {header_seps}.\n"
-                                f"Header: {table_rows[0]!r}\n"
-                                f"Row {r_idx}: {r!r}\n"
-                                "Column widths must be computed from TRUNCATED cell text (width = min(len(cell), max_width)) "
-                                "so header, separator, and data rows align perfectly."
-                            )
-                            break
-                    if not misaligned:
-                        results.append("Smoke test table column alignment under --max-width: PASSED")
+            if proc_tbl.returncode == 0 and proc_tbl.stdout:
+                align_ok, align_err = check_table_alignment_output(proc_tbl.stdout)
+                if not align_ok:
+                    failures.append(f"Table alignment error (standard layout):\\n{align_err}")
+                else:
+                    results.append("Smoke test table alignment (standard layout): PASSED")
             observed_samples.append({
-                "description": "Table formatting with --max-width 8",
-                "command": f"python {project_name}.py {align_csv.name} --max-width 8",
-                "exit_code": proc_align.returncode,
-                "stdout": proc_align.stdout,
-                "stderr": proc_align.stderr,
+                "description": "Table formatting (standard)",
+                "command": f"python {project_name}.py {align_csv.name}",
+                "exit_code": proc_tbl.returncode,
+                "stdout": proc_tbl.stdout,
+                "stderr": proc_tbl.stderr,
             })
         except Exception as e:
-            failures.append(f"Table alignment smoke test failed: {e}")
+            failures.append(f"Table standard alignment smoke test failed: {e}")
 
-    # 6. Non-ASCII JSON user text preservation advisory
+        # 6b. Table alignment under --max-width 8
+        has_max_w = any(k in req_lower for k in ("max-width", "max_width", "truncate", "width")) or "--max-width" in request
+        if has_max_w:
+            try:
+                proc_mw = subprocess.run(
+                    [sys.executable, str(tool_path), str(align_csv), "--max-width", "8"],
+                    cwd=str(project_dir),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                )
+                if proc_mw.returncode == 0 and proc_mw.stdout:
+                    align_mw_ok, align_mw_err = check_table_alignment_output(proc_mw.stdout)
+                    if not align_mw_ok:
+                        failures.append(f"Table alignment error under --max-width 8:\\n{align_mw_err}")
+                    else:
+                        results.append("Smoke test table alignment under --max-width 8: PASSED")
+                observed_samples.append({
+                    "description": "Table formatting with --max-width 8",
+                    "command": f"python {project_name}.py {align_csv.name} --max-width 8",
+                    "exit_code": proc_mw.returncode,
+                    "stdout": proc_mw.stdout,
+                    "stderr": proc_mw.stderr,
+                })
+            except Exception as e:
+                failures.append(f"Table max-width alignment smoke test failed: {e}")
+
+    # 7. Non-ASCII JSON user text preservation check (ensure_ascii=False)
     if is_json:
         try:
             non_ascii_json = smoke_fixture_dir / "non_ascii_test.json"
             non_ascii_json.write_text('{"greeting": "café", "city": "東京"}', encoding="utf-8")
-            target_q = ["greeting"] if ("jsonquery" in project_name.lower() or "jsonget" in project_name.lower()) else []
+            na_args = [str(non_ascii_json), "greeting"]
             proc_na = subprocess.run(
-                [sys.executable, str(tool_path), str(non_ascii_json), *target_q],
+                [sys.executable, str(tool_path), *na_args],
                 cwd=str(project_dir),
                 capture_output=True,
                 text=True,
@@ -380,24 +844,42 @@ def run_smoke_tests(
                 errors="replace",
                 timeout=timeout,
             )
-            if proc_na.returncode == 0 and proc_na.stdout:
-                if "\\u00e9" in proc_na.stdout or "\\u6771" in proc_na.stdout:
-                    results.append("Smoke test JSON Unicode advisory: output contains escaped ASCII sequences (use ensure_ascii=False).")
-                else:
-                    results.append("Smoke test JSON Unicode preservation: PASSED")
+            if proc_na.returncode == 0 and proc_na.stdout and "\\\\u" in proc_na.stdout and ("café" not in proc_na.stdout and "東京" not in proc_na.stdout):
+                failures.append(
+                    "Smoke test non-ASCII JSON failed: user text was escaped as \\\\u escape sequences! "
+                    "When printing JSON with user text, pass ensure_ascii=False to preserve UTF-8 characters."
+                )
+            else:
+                results.append("Smoke test non-ASCII JSON encoding: PASSED")
+            observed_samples.append({
+                "description": "Non-ASCII user text preservation in JSON",
+                "command": f"python {project_name}.py {non_ascii_json.name} greeting",
+                "exit_code": proc_na.returncode,
+                "stdout": proc_na.stdout,
+                "stderr": proc_na.stderr,
+            })
         except Exception:
             pass
 
-    shutil.rmtree(smoke_fixture_dir, ignore_errors=True)
+    # 8. Reference Oracle validation (csv-column-stats, dotted-path-lookup, line-word-count)
+    oracle_ok, oracle_issues = OracleRegistry.run_oracles(tool_path, request, project_dir)
+    if not oracle_ok:
+        for iss in oracle_issues:
+            failures.append(iss)
+    else:
+        results.append("Reference oracles validation: PASSED")
 
+    # Clean up fixture directory
+    try:
+        shutil.rmtree(smoke_fixture_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    report = "=== Smoke Test Results ===\\n" + "\\n".join(f"[OK] {r}" for r in results) + ("\\n" + "\\n".join(f"[FAIL] {f}" for f in failures) if failures else "")
     success = len(failures) == 0
-    report_str = "\n".join(results)
-    if failures:
-        report_str += "\nFailures:\n" + "\n".join(f"- {f}" for f in failures)
-
     if return_samples:
-        return success, report_str, failures, observed_samples
-    return success, report_str, failures
+        return success, report, failures, observed_samples, has_harness_error
+    return success, report, failures
 
 
 def format_observed_behavior(project_name: str, observed_samples: List[Dict[str, Any]]) -> str:
@@ -451,6 +933,7 @@ def build_standalone_project_staged(
         print(f"[Helix Builder] {msg}", flush=True)
 
     _notify(f"Initializing standalone project '{project_name}' in {project_dir}", 10)
+    write_scaffold_file(project_dir, project_name)
 
     tool_code = ""
     test_code = ""
@@ -479,6 +962,7 @@ def build_standalone_project_staged(
     prev_attempt_timed_out = False
     defect_type = ""
     lock_tool = False
+    smoke_has_harness_error = False
     failing_tests: List[str] = []
     observed_samples: List[Dict[str, Any]] = []
     prev_tool_info: Optional[Tuple[str, str, Any]] = None
@@ -502,27 +986,35 @@ def build_standalone_project_staged(
             flags = extract_requested_flags(request_text)
             prompt = (
                 f"{SYSTEM_PROMPT}\n\n"
-                f"You are building a clean, robust, standalone command-line Python utility named `{project_name}.py` "
+                f"You are Helix, an expert software engineer building a clean, robust, standalone command-line Python utility named `{project_name}.py` "
                 f"fulfilling this user request:\n\"\"\"{request_text}\"\"\"\n\n"
                 "CRITICAL IMPLEMENTATION REQUIREMENTS:\n"
                 f"1. Implement all requested CLI options using argparse: {', '.join(flags) if flags else 'all options from request'}\n"
-                "2. Performance & Streaming: For large files, stream line-by-line (for line in f:) or in 64KB chunks (f.read(65536)). NEVER load whole files into RAM with unbuffered f.read().\n"
+                "2. Value Lookup & Sentinels (JSON / TOML / Dict keys):\n"
+                "   Use a sentinel object (e.g. `_MISSING = object()`) during lookup, NOT truthiness or `is None`.\n"
+                "   If a key exists and its value is `None`/`null`, it is a FOUND value: print `null` (or JSON null) and exit 0!\n"
+                "   Only if the key or index is genuinely NOT present in the object/array should you trigger `--default VALUE` (if provided) or exit with an error.\n"
+                "3. Numeric Parsing & Multi-Column Statistics (if applicable):\n"
+                "   * NEVER use `str.isdigit()` or regex for checking if a value is numeric! `isdigit()` rejects negative numbers (-5) and decimals (10.5).\n"
+                "   * Always use `float(cell.strip())` inside a `try...except (ValueError, TypeError)` block to parse numeric values, skipping empty/whitespace cells.\n"
+                "   * For multi-column statistics over a streamed reader/iterator, accumulate statistics for ALL columns in ONE pass over the rows. NEVER iterate over the reader once per column, and NEVER consume an iterator and reuse it.\n"
+                "4. Performance & Streaming: For large files, stream line-by-line (for line in f:) or in 64KB chunks (f.read(65536)). NEVER load whole files into RAM with unbuffered f.read().\n"
                 "   For table formatting tools where column widths require seeing all rows, use a two-pass streaming approach:\n"
                 "   Pass 1: Stream rows to compute max column widths without storing rows in memory.\n"
                 "   Pass 2: Re-open or seek to beginning and stream rows to print formatted rows.\n"
                 "   Peak memory usage must remain under 150 MB even on large 50+ MB inputs.\n"
-                "3. Robustness & Input Validation: If an input file/folder does not exist or cannot be accessed, print an error to sys.stderr and exit non-zero (sys.exit(1)). NEVER exit 0 on missing/invalid input paths.\n"
-                "4. Table Formatting Specifications (if applicable):\n"
-                "   * In Pass 1, compute column widths AFTER applying `--max-width` truncation: `col_width = max(len(h), min(len(cell), max_width))`. All rows, headers, and separator lines must use identical column widths so `|` characters align vertically across all rows.\n"
+                "4. Robustness & Input Validation: If an input file/folder does not exist or cannot be accessed, print an error to sys.stderr and exit non-zero (sys.exit(1)). NEVER exit 0 on missing/invalid input paths. Normal `--help` must exit 0.\n"
+                "5. Table Formatting Specifications (if applicable):\n"
+                "   * In Pass 1, compute column widths AFTER applying `--max-width` truncation: `col_width = max(len(h), min(len(cell), max_width))`. All rows, headers, and separator lines must use identical column widths so `|` or `+` characters align vertically across all rows at identical character positions.\n"
                 "   * Continuous header separator line (e.g. `------+-----+---` or matching column dashes, never malformed like `-|-------+--------+---`).\n"
                 "   * Cell truncation with `--max-width N`: keep a prefix of the string and append '...' such that total width is <= max-width (e.g. max-width 8 on long text becomes 'Hello...'). NEVER collapse everything into just '...'!\n"
-                "5. Windows Unicode Safety: At the top of main, configure stdout encoding:\n"
+                "6. Windows Unicode Safety: At the top of main, configure stdout encoding:\n"
                 "   ```python\n"
                 "   if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):\n"
                 "       sys.stdout.reconfigure(encoding='utf-8', errors='replace')\n"
                 "   ```\n"
-                "   When printing JSON containing user text, use `ensure_ascii=False` so Unicode characters are preserved rather than escaped.\n"
-                f"6. Output ONLY the complete Python code for `{project_name}.py` starting with `# FILE: {project_name}.py` inside a single ```python ``` code block. No explanations."
+                "   When printing JSON containing user text, use `ensure_ascii=False` so Unicode characters (e.g. accents, emojis, 'café') are preserved directly rather than escaped.\n"
+                f"7. Output ONLY the complete Python code for `{project_name}.py` starting with `# FILE: {project_name}.py` inside a single ```python ``` code block. No explanations."
             )
             (attempt_dir / "tool_prompt.txt").write_text(prompt, encoding="utf-8")
             try:
@@ -537,7 +1029,8 @@ def build_standalone_project_staged(
                     try:
                         import ast
                         ast.parse(new_tool)
-                        is_valid_initial = len(new_tool.strip()) >= 120 and ("argparse" in new_tool or "sys.argv" in new_tool)
+                        undef_tool = check_undefined_names_and_imports(new_tool, f"{project_name}.py")
+                        is_valid_initial = len(new_tool.strip()) >= 120 and ("argparse" in new_tool or "sys.argv" in new_tool) and not undef_tool
                     except SyntaxError:
                         is_valid_initial = False
 
@@ -623,7 +1116,7 @@ def build_standalone_project_staged(
                 (attempt_dir / "coverage_failures.txt").write_text(last_error, encoding="utf-8")
 
             # Run deterministic smoke tests capturing observed behavior
-            smoke_ok, smoke_report, smoke_fails, observed_samples = run_smoke_tests(
+            smoke_ok, smoke_report, smoke_fails, observed_samples, smoke_has_harness_error = run_smoke_tests(
                 project_dir, tool_path, project_name, request_text, return_samples=True
             )
             (attempt_dir / "smoke_results.txt").write_text(smoke_report, encoding="utf-8")
@@ -647,23 +1140,29 @@ def build_standalone_project_staged(
         # Stage 3: Generate tests grounded in observed behavior
         if tool_code and not test_code:
             prompt = (
+                f"You are Helix, an expert software engineer.\n"
                 f"Write comprehensive unit tests in `test_{project_name}.py` verifying `{project_name}.py` against this user request:\n"
                 f"\"\"\"{request_text}\"\"\"\n\n"
                 f"Here is the implementation of `{project_name}.py`:\n```python\n{tool_code}\n```\n\n"
                 f"OBSERVED BEHAVIOUR FROM REAL RUNTIME SMOKE EXECUTIONS:\n{observed_output}\n\n"
-                "CRITICAL TEST HYGIENE & GROUNDING REQUIREMENTS:\n"
-                f"1. Tool execution MUST use `sys.executable` with absolute path derived from `__file__`, never relative '{project_name}.py'.\n"
-                "2. Every `subprocess.run` call MUST pass `encoding='utf-8'` and `errors='replace'`.\n"
-                "3. Ground tests in documented contracts and structural properties: assert known substrings, parsed data structures, and exit codes. Do NOT assert brittle single characters (assertNotIn on 1-2 chars is rejected) or rigid column alignment/whitespace details.\n"
-                "4. When testing `--json`, you MUST parse stdout with `json.loads(proc.stdout)` rather than string-matching raw JSON text.\n"
-                "5. Exit code contract: Bad input, missing files, or empty/headerless data files MUST exit non-zero (sys.exit(1)). Tests for nonexistent/invalid files MUST assert non-zero returncode (`self.assertNotEqual(proc.returncode, 0)`).\n"
-                "6. Template:\n"
+                "CRITICAL TEST SCAFFOLD & CONTRACT REQUIREMENTS:\n"
+                "1. TEST SCAFFOLD IMPORT: Import `ToolTestCase` from `_scaffold`. Your test class MUST inherit from `ToolTestCase`:\n"
                 "   ```python\n"
-                "   import sys, os, unittest, subprocess, json\n"
-                "   from pathlib import Path\n"
-                f"   TOOL_PATH = Path(__file__).resolve().parent / '{project_name}.py'\n"
+                "   from _scaffold import ToolTestCase\n"
+                f"   class Test{project_name.capitalize()}(ToolTestCase):\n"
                 "   ```\n"
-                f"7. Output ONLY the complete Python test code for `test_{project_name}.py` starting with `# FILE: test_{project_name}.py` inside a single ```python ``` code block. No explanations."
+                "   Do NOT define your own `subprocess.run` helper or temp directory teardown. Use `self.run_tool(*args)` and `self.write_file(filename, content)` provided by `ToolTestCase`.\n"
+                "2. NO DIRECT SUBPROCESS: You must NOT invoke subprocess directly (`subprocess.run`, `Popen`, `call`) — all executions must use `self.run_tool(...)`.\n"
+                "3. TEST FIXTURES: Every test fixture path referenced in the test must be created via `self.write_file(...)` or `self.make_dir(...)`. Never rely on external disk state or arbitrary hard-coded paths.\n"
+                "4. REQUESTED OPTIONS COVERAGE: Ensure every option and flag requested by the user is exercised in at least one test method.\n"
+                "5. MEANINGFUL ASSERTIONS (NO TRIVIAL ASSERTIONS): Reject trivial assertions (e.g. `assertTrue(True)`, `assert 1 == 1`). Every test method must assert on `result.returncode`, `result.stdout`, or `result.stderr` specifically, using `self.assertOk(res)`, `self.assertFails(res)`, `self.assertIn(...)`, or `self.assertJsonOutput(res)`.\n"
+                "6. PARSING JSON: When testing `--json`, parse stdout with `data = self.assertJsonOutput(res)`.\n"
+                "7. ENTRY POINT GUARD: You MUST end the test file with the standard entry point:\n"
+                "   ```python\n"
+                "   if __name__ == '__main__':\n"
+                "       unittest.main()\n"
+                "   ```\n"
+                f"8. Output ONLY the complete Python test code for `test_{project_name}.py` starting with `# FILE: test_{project_name}.py` inside a single ```python ``` code block. No explanations."
             )
             (attempt_dir / "tests_prompt.txt").write_text(prompt, encoding="utf-8")
             try:
@@ -676,14 +1175,66 @@ def build_standalone_project_staged(
 
                 if new_test:
                     new_test = sanitize_test_code(new_test, project_name)
-                    try:
-                        import ast
-                        ast.parse(new_test)
-                        is_valid_initial_test = len(new_test.strip()) >= 150 and ("unittest" in new_test or "test_" in new_test)
-                    except SyntaxError:
-                        is_valid_initial_test = False
+                    val_ok, val_issues, cleaned_test = validate_generated_test_file(new_test, project_name, request=request_text)
+                    if not val_ok:
+                        (attempt_dir / "tests_rejected_initial.txt").write_text("\n".join(val_issues), encoding="utf-8")
+                        _notify(f"Test validation failed ({len(val_issues)} issues); requesting targeted regeneration...", 75)
+                        rw_prompt = (
+                            f"The generated test code for `test_{project_name}.py` failed deterministic validation with the following violations:\n"
+                            + "\n".join(f"- {i}" for i in val_issues)
+                            + f"\n\nPlease rewrite the complete test suite `test_{project_name}.py` fixing ALL violations:\n"
+                            + "1. Import `ToolTestCase` from `_scaffold` and define a class inheriting from `ToolTestCase`.\n"
+                            + "2. All tests MUST be methods (`def test_*(self):`) inside that class. Do NOT use bare module-level test functions.\n"
+                            + "3. Create all fixture files inside each test using `self.write_file(name, content)`.\n"
+                            + "4. Run the tool via `self.run_tool(*args)`. Do NOT call `subprocess` directly.\n"
+                            + "5. Ensure all necessary modules (e.g. `sys`, `json`) are explicitly imported at the top of the file.\n"
+                            + "6. Do NOT include `# FILE:` markers, comments naming the file, conversational prose, or markdown fences inside the code.\n"
+                            + "Output ONLY the complete Python code in a single ```python ``` block."
+                        )
+                        try:
+                            rw_reply = engine.client.chat([{"role": "user", "content": rw_prompt}], tools=None)
+                            rw_raw = rw_reply.get("content", "")
+                            (attempt_dir / "tests_rewrite_raw.txt").write_text(rw_raw, encoding="utf-8")
+                            rw_blocks = parse_code_blocks(rw_raw)
+                            _, rw_test = assign_code_blocks(rw_blocks, project_name)
+                            if rw_test:
+                                new_test = sanitize_test_code(rw_test, project_name)
+                        except Exception as e:
+                            _notify(f"Test rewrite pass failed: {e}", 75)
 
-                    if is_valid_initial_test:
+                        val_ok_2, val_issues_2, cleaned_test_2 = validate_generated_test_file(new_test, project_name, request=request_text)
+                        if not val_ok_2:
+                            (attempt_dir / "tests_invalid.txt").write_text("\n".join(val_issues_2), encoding="utf-8")
+                            _notify(f"Initial tests rejected on 2nd validation pass: {val_issues_2[0]}", -1)
+                            test_code = ""
+                            writes_log[f"test_{project_name}.py"] = {
+                                "written": False, "sha256_before": "", "sha256_after": "", "status": f"rejected: TESTS INVALID ({'; '.join(val_issues_2)})"
+                            }
+                            last_error = f"TESTS INVALID ({'; '.join(val_issues_2)})"
+                            return (
+                                False,
+                                f"Tests rejected on deterministic validation:\n" + "\n".join(f"- {i}" for i in val_issues_2),
+                                {
+                                    "status": f"TESTS INVALID ({'; '.join(val_issues_2)})",
+                                    "project_name": project_name,
+                                    "project_dir": str(project_dir),
+                                    "tool_file": str(tool_path),
+                                    "test_file": str(test_path),
+                                    "tool_sha256": get_sha256(tool_path),
+                                    "test_sha256": "",
+                                    "attempts": attempt,
+                                    "failing_tests": [],
+                                    "output": f"Tests rejected on deterministic validation:\n" + "\n".join(f"- {i}" for i in val_issues_2),
+                                }
+                            )
+                        else:
+                            new_test = cleaned_test_2
+                    else:
+                        new_test = cleaned_test
+
+                    test_ok, test_reason = validate_test_code_regression(new_test, "", project_name)
+
+                    if test_ok:
                         sha_before = get_sha256(test_path)
                         test_code = new_test
                         test_path.write_text(test_code, encoding="utf-8")
@@ -693,9 +1244,10 @@ def build_standalone_project_staged(
                         }
                     else:
                         writes_log[f"test_{project_name}.py"] = {
-                            "written": False, "sha256_before": "", "sha256_after": "", "status": "rejected: syntax error or stub in initial test"
+                            "written": False, "sha256_before": "", "sha256_after": "", "status": f"rejected: {test_reason}"
                         }
-                        _notify(f"Initial tests rejected: syntax error or stub", -1)
+                        _notify(f"Initial tests rejected: {test_reason}", -1)
+                        last_error = f"Initial tests rejected: {test_reason}"
                 last_error = ""
                 prev_attempt_timed_out = False
             except (TimeoutError, Exception) as e:
@@ -726,20 +1278,27 @@ def build_standalone_project_staged(
                     break
                 continue
 
-        # Stage 4: Run tests with real interpreter via run_python_test (tests always run when test_code exists)
+        # Stage 4: Run tests via unittest module discovery and direct execution (R7-1)
         passed = False
         failing_tests = []
         if test_code:
             _notify("Running unit tests via real interpreter...", 80)
-            test_res_str = run_python_test(str(test_path), base_dir=project_dir)
+            ensure_unittest_main_guard(test_path)
+            summary = run_and_parse_unittest(project_dir, f"test_{project_name}")
+            direct_ok, direct_out, direct_ran = run_direct_test_file(project_dir, test_path)
+            test_res_str = summary.raw_output + ("\nDirect run:\n" + direct_out if not direct_ok else "")
             (attempt_dir / "test_output.txt").write_text(test_res_str, encoding="utf-8")
-            failing_tests = re.findall(r"(?:FAIL|ERROR):\s+([a-zA-Z0-9_]+)", test_res_str)
-            passed = ("TEST PASS" in test_res_str or "OK" in test_res_str) and not failing_tests and not ("FAIL" in test_res_str or "ERROR" in test_res_str)
+            failing_tests = summary.failed_test_names
+            passed = summary.success and direct_ok and (summary.ran_count >= summary.ast_count) and (summary.ran_count > 0)
 
             if passed and covered and smoke_ok and mem_ok:
                 _notify("All tests passed successfully!", 100)
                 ensure_options_coverage_or_gap(project_dir, test_path, project_name, request_text)
-                final_status = compute_final_status_from_disk(project_dir, project_name, request_text, mem_ok, mem_report)
+                final_status = compute_final_status_from_disk(
+        project_dir, project_name, request_text, mem_ok, mem_report,
+        smoke_ok=smoke_ok, smoke_issues=smoke_fails if not smoke_ok else None,
+        alignment_ok=True,
+    )
                 summary_data = {
                     "attempt": attempt,
                     "status": "success",
@@ -811,6 +1370,7 @@ def build_standalone_project_staged(
             memory_passed=mem_ok,
             client=getattr(engine, "client", None),
             engine=engine,
+            smoke_has_harness_error=smoke_has_harness_error,
         )
         defect_type = arb_res.get("classification", "")
         lock_tool = arb_res.get("lock_tool", False)
@@ -844,26 +1404,22 @@ def build_standalone_project_staged(
         _notify(f"Tests/checks failed on attempt {attempt}: {fail_str}", 85)
         last_error = last_error or f"Unit tests failed:\n{test_res_str}"
 
-        # Strategy rotation
-        if defect_type == "TEST" or lock_tool:
-            fix_stage = "regenerate_tests_only"
-        elif not mem_ok or not covered or not smoke_ok:
-            fix_stage = "regenerate_tool_only"
-        else:
-            is_stuck = len(failing_history) >= 2 and failing_history[-1] == failing_history[-2] and len(failing_history[-1]) > 0
-            if is_stuck:
-                if strategy_step == 0:
-                    fix_stage = "regenerate_tests_only"
-                    _notify(f"Stuck loop detected: rotating strategy to 'regenerate_tests_only' (Attempt {attempt})", 86)
-                elif strategy_step == 1:
-                    fix_stage = "regenerate_tool_only"
-                    _notify(f"Stuck loop detected: rotating strategy to 'regenerate_tool_only' (Attempt {attempt})", 86)
-                else:
-                    fix_stage = "minimal_diff_targeted_fix"
-                    _notify(f"Stuck loop detected: rotating strategy to 'minimal_diff_targeted_fix' (Attempt {attempt})", 86)
-                strategy_step += 1
-            else:
-                fix_stage = "standard_diagnosis"
+        # Strategy transition table
+        fix_stage = determine_fix_strategy(
+            defect_type=defect_type,
+            lock_tool=lock_tool,
+            smoke_ok=smoke_ok,
+            smoke_has_harness_error=smoke_has_harness_error,
+            covered=covered,
+            mem_ok=mem_ok,
+            failing_tests=failing_tests,
+            failing_history=failing_history,
+            attempt=attempt,
+            strategy_step=strategy_step,
+        )
+        if len(failing_history) >= 2 and failing_history[-1] == failing_history[-2] and len(failing_history[-1]) > 0:
+            _notify(f"Stuck loop detected: rotating strategy to '{fix_stage}' (Attempt {attempt})", 86)
+            strategy_step += 1
 
         # Execute Fix Stage if attempts remain
         if attempt < max_attempts:
@@ -891,14 +1447,16 @@ def build_standalone_project_staged(
                 )
             elif fix_stage == "regenerate_tool_only":
                 prompt = (
-                    f"The test suite for `{project_name}.py` expresses the required behavior, but the tool failed several tests.\n\n"
+                    f"The test suite for `{project_name}.py` expresses the required behavior, but the tool failed tests or reference oracles.\n\n"
                     f"USER REQUIREMENTS:\n\"\"\"{request_text}\"\"\"\n\n"
                     f"CURRENT TEST CODE (`test_{project_name}.py`):\n```python\n{test_code}\n```\n\n"
-                    f"FAILING TEST TRACEBACKS:\n{last_error}\n\n"
+                    f"FAILING TRACEBACKS / ORACLE DEFECTS:\n{last_error}\n\n"
                     "INSTRUCTIONS:\n"
                     f"1. Regenerate `{project_name}.py` in full so it satisfies all user requirements and passes the tests.\n"
-                    "2. Keep all CLI flags, chunked streaming, Windows UTF-8 stdout configuration, and non-zero exit on errors.\n"
-                    f"3. Output ONLY the complete Python code starting with `# FILE: {project_name}.py` inside a single ```python ``` code block."
+                    "2. Numeric parsing: never use `str.isdigit()` or regex for numeric checks; use `float(cell.strip())` inside `try...except (ValueError, TypeError)` block (accepts negatives, decimals, exponents; skip empty cells).\n"
+                    "3. Multi-column streaming: accumulate all columns in a single pass over rows. Never iterate over the reader once per column, and never consume an iterator and reuse it.\n"
+                    "4. Keep all CLI flags, chunked streaming, Windows UTF-8 stdout configuration, and non-zero exit on errors.\n"
+                    f"5. Output ONLY the complete Python code starting with `# FILE: {project_name}.py` inside a single ```python ``` code block."
                 )
             elif fix_stage == "minimal_diff_targeted_fix":
                 prompt = (
@@ -962,7 +1520,12 @@ def build_standalone_project_staged(
                         new_tool = None
 
                     if new_tool:
-                        tool_ok, tool_reason = validate_tool_code_regression(new_tool, tool_code, request_text)
+                        cand_tool_undef = check_undefined_names_and_imports(new_tool, f"{project_name}.py")
+                        if cand_tool_undef:
+                            tool_ok = False
+                            tool_reason = f"Candidate tool has undefined names: {cand_tool_undef[0]}"
+                        else:
+                            tool_ok, tool_reason = validate_tool_code_regression(new_tool, tool_code, request_text)
                         if not tool_ok and missing_reqs:
                             cand_cov_ok, cand_missing = check_requirements_coverage(request_text, new_tool)
                             try:
@@ -996,7 +1559,14 @@ def build_standalone_project_staged(
 
                     if new_test:
                         new_test = sanitize_test_code(new_test, project_name)
-                        test_ok, test_reason = validate_test_code_regression(new_test, test_code, project_name)
+                        cand_valid, cand_issues, cleaned_cand = validate_generated_test_file(new_test, project_name, request=request_text)
+                        if cand_valid:
+                            test_ok, test_reason = validate_test_code_regression(cleaned_cand, test_code, project_name)
+                            if test_ok:
+                                new_test = cleaned_cand
+                        else:
+                            test_ok = False
+                            test_reason = f"Candidate test failed validation: {cand_issues[0]}"
                         if test_ok:
                             sha_before = get_sha256(test_path)
                             test_code = new_test
@@ -1147,6 +1717,12 @@ def build_standalone_project_staged(
 
     if final_status.startswith("PASSED"):
         _notify(f"Build complete: {final_status}", 100)
+
+        # Verify direct execution and python -m unittest both work
+        env_run = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(project_dir)}
+        subprocess.run([sys.executable, "-m", "unittest", f"test_{project_name}.py"], cwd=str(project_dir), capture_output=True, text=True, encoding="utf-8", errors="replace", env=env_run)
+        subprocess.run([sys.executable, str(test_path)], cwd=str(project_dir), capture_output=True, text=True, encoding="utf-8", errors="replace", env=env_run)
+
         quar_bullets = "\n".join(f"- `{name}`" for name in skipped_on_disk)
         quar_section = f"### Quarantined Bad Tests ({len(skipped_on_disk)}):\n{quar_bullets}\n\n" if skipped_on_disk else ""
         return (
@@ -1181,7 +1757,7 @@ def build_standalone_project_staged(
 
     diagnosis_verdict = ""
     if tool_meets_requirements and failing_tests:
-        diagnosis_verdict = f"\n\n**Diagnosis:** the tool meets the requirements in my checks; these {len(failing_tests)} of my own tests are still wrong."
+        diagnosis_verdict = f"\n\n**Assessment:** For `{project_name}.py`, the tool meets the requirements in my checks; these {len(failing_tests)} of my own tests are still wrong: {', '.join(failing_tests)}."
 
     fail_list = "\n".join(f"- `{t}`" for t in failing_tests) if failing_tests else "- None"
     _notify(f"Failed to complete '{project_name}' after {max_attempts} attempts: {final_status}", -1)

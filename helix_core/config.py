@@ -223,8 +223,11 @@ Always ensure your code is syntactically valid and completely avoids placeholder
 ### Software Quality & Implementation Checklist:
 - Requirements Completeness: Re-check all requested CLI flags (e.g. `--json`, `--min-size`), positional arguments, and calculations (e.g. wasted disk space). Every requested item must be fully implemented and covered by unit tests.
 - Chunked File Reading: NEVER read entire large files into memory with `f.read()`. Always stream file I/O in binary chunks (e.g. `while chunk := f.read(65536): hasher.update(chunk)`).
+- Numeric Parsing & Statistics: Never use `str.isdigit()` or regex for "is numeric"; use `float(cell.strip())` inside `try...except (ValueError, TypeError)` (handle negatives, decimals, exponents; skip empty cells). When computing multi-column statistics from a stream/CSV, accumulate all columns in a single pass over rows. Never consume an iterator and reuse it.
+- Table Alignment: For table output with columns, calculate each column width as max of header length and data value lengths. Header row, separator line, and all data rows must share identical column widths and separator positions.
 - Safe Path & Error Handling: Wrap file/folder access in `try...except (OSError, PermissionError)` so unreadable, locked, or nonexistent paths produce clean user errors and do not crash. If an input file or folder does not exist or is invalid, print an error to sys.stderr and exit non-zero (sys.exit(1)). NEVER exit 0 on nonexistent or invalid paths.
 - Windows UTF-8 Safety: Prevent `UnicodeEncodeError` when printing non-ASCII text on Windows console. Always configure stdout encoding at startup: `if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')`.
+- Test Entry Point Guard: Unit test files must always end with `if __name__ == '__main__': unittest.main()`.
 - Thorough Testing: Author tests that assert real behavior, duplicate grouping by content (not directory), wasted disk space calculations ((count - 1) * file_size), boundary thresholds, and edge cases.
 - Truthful Execution: Never claim files were saved or tests passed unless you executed the real tool calls (`write_file`, `run_python_test`) and they succeeded.
 """

@@ -615,9 +615,12 @@ def test_h3_standalone_staged_builder_success_and_failure() -> None:
         "print('Done')\n"
     )
     passing_test = (
+        "from _scaffold import ToolTestCase\n"
         "import unittest\n"
-        "class T(unittest.TestCase):\n"
-        "    def test_ok(self): self.assertTrue(True)\n"
+        "class T(ToolTestCase):\n"
+        "    def test_ok(self):\n"
+        "        res = self.run_tool('--help')\n"
+        "        self.assertEqual(res.returncode, 0)\n"
         "if __name__ == '__main__': unittest.main()\n"
     )
 
@@ -683,10 +686,11 @@ args = parser.parse_args()
 print("processed")
 """
     failing_test = """
+from _scaffold import ToolTestCase
 import unittest
-class T(unittest.TestCase):
+class T(ToolTestCase):
     def test_fail(self):
-        self.assertEqual(1, 2)
+        self.assertEqual(1, 999)
 if __name__ == '__main__':
     unittest.main()
 """
@@ -733,10 +737,11 @@ if not os.path.exists(args.file):
 print("done processing data")
 """
     failing_test = """
+from _scaffold import ToolTestCase
 import unittest
-class T(unittest.TestCase):
+class T(ToolTestCase):
     def test_fail(self):
-        self.assertEqual(1, 2)
+        self.assertEqual(1, 999)
 if __name__ == '__main__':
     unittest.main()
 """
@@ -792,12 +797,15 @@ if not os.path.exists(args.file):
 print("ok")
 """
     passing_test = """
+from _scaffold import ToolTestCase
 import unittest
-class TestMockTool(unittest.TestCase):
+class TestMockTool(ToolTestCase):
     def test_ok(self):
-        self.assertEqual(1, 1)
+        res = self.run_tool('--help')
+        self.assertEqual(res.returncode, 0)
     def test_another(self):
-        self.assertTrue(True)
+        res = self.run_tool('--help')
+        self.assertEqual(res.returncode, 0)
 if __name__ == '__main__':
     unittest.main()
 """
@@ -850,18 +858,22 @@ if not os.path.exists(args.file):
 print("ok")
 """
     failing_test = """
+from _scaffold import ToolTestCase
 import unittest
-class T(unittest.TestCase):
+class T(ToolTestCase):
     def test_fixed_fail(self):
-        self.assertEqual(1, 999)
+        res = self.run_tool('--help')
+        self.assertEqual(res.returncode, 999)
 if __name__ == '__main__':
     unittest.main()
 """
     passing_test = """
+from _scaffold import ToolTestCase
 import unittest
-class T(unittest.TestCase):
+class T(ToolTestCase):
     def test_fixed_pass(self):
-        self.assertEqual(1, 1)
+        res = self.run_tool('--help')
+        self.assertEqual(res.returncode, 0)
 if __name__ == '__main__':
     unittest.main()
 """
@@ -910,29 +922,46 @@ if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
 parser = argparse.ArgumentParser()
 parser.add_argument('file')
 parser.add_argument('--json', action='store_true')
+parser.add_argument('--strict', action='store_true')
 args = parser.parse_args()
 if not os.path.exists(args.file):
     print("error", file=sys.stderr)
     sys.exit(1)
-print("ok")
+if args.json:
+    print('{"status": "ok"}')
+else:
+    print("ok")
 """
     one_fail_test = """
-import unittest
-class T(unittest.TestCase):
+from _scaffold import ToolTestCase
+import json, unittest
+class T(ToolTestCase):
     def test_ok(self):
-        self.assertEqual(1, 1)
+        f = self.write_file("data.txt", "content")
+        res = self.run_tool(str(f), "--json")
+        self.assertOk(res)
+        data = self.assertJsonOutput(res)
+        self.assertEqual(data["status"], "ok")
     def test_bad(self):
-        self.assertEqual(1, 2)
+        f = self.write_file("data.txt", "content")
+        res = self.run_tool(str(f), "--strict")
+        self.assertEqual(res.returncode, 999)
 if __name__ == '__main__':
     unittest.main()
 """
     two_fail_test = """
-import unittest
-class T(unittest.TestCase):
+from _scaffold import ToolTestCase
+import json, unittest
+class T(ToolTestCase):
     def test_bad1(self):
-        self.assertEqual(1, 2)
+        f = self.write_file("data.txt", "content")
+        res = self.run_tool(str(f), "--json", "--strict")
+        self.assertJsonOutput(res)
+        self.assertEqual(res.returncode, 999)
     def test_bad2(self):
-        self.assertEqual(3, 4)
+        f = self.write_file("data.txt", "content")
+        res = self.run_tool(str(f), "--strict")
+        self.assertEqual(res.returncode, 888)
 if __name__ == '__main__':
     unittest.main()
 """
@@ -947,7 +976,7 @@ if __name__ == '__main__':
     with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
         success, msg, details = build_standalone_project_staged(
             engine,
-            "Build me a command-line tool called mocktool. It needs a --json option.",
+            "Build me a command-line tool called mocktool. It needs a --json option and a --strict option.",
             max_attempts=2,
         )
         assert success is False
@@ -1037,10 +1066,12 @@ if not os.path.exists(args.file):
 print("ok")
 """
     passing_test = """
+from _scaffold import ToolTestCase
 import unittest
-class T(unittest.TestCase):
+class T(ToolTestCase):
     def test_ok(self):
-        self.assertEqual(1, 1)
+        res = self.run_tool('--help')
+        self.assertEqual(res.returncode, 0)
 if __name__ == '__main__':
     unittest.main()
 """
@@ -1120,10 +1151,11 @@ if not os.path.exists(args.file):
 print("ok")
 """
     failing_test = """
+from _scaffold import ToolTestCase
 import unittest
-class T(unittest.TestCase):
+class T(ToolTestCase):
     def test_fail(self):
-        self.assertEqual(1, 2)
+        self.assertEqual(1, 999)
 if __name__ == '__main__':
     unittest.main()
 """
@@ -1310,16 +1342,15 @@ if not os.path.exists(args.file):
 print("ok")
 """
     bad_output_test = """
-import unittest, subprocess, sys
-from pathlib import Path
-TOOL_PATH = Path(__file__).resolve().parent / 'dupefinder.py'
+from _scaffold import ToolTestCase
+import unittest
 
-class TestDupe(unittest.TestCase):
+class TestDupe(ToolTestCase):
     def test_rigid_bad_assertion(self):
-        res = subprocess.run([sys.executable, str(TOOL_PATH), '--help'], capture_output=True, text=True, encoding='utf-8')
+        res = self.run_tool('--help')
         self.assertEqual(res.stdout, "THIS RIGID STRING CONTRADICTS OBSERVED SMOKE OUTPUT")
     def test_valid_runs(self):
-        res = subprocess.run([sys.executable, str(TOOL_PATH), '--help'], capture_output=True, text=True, encoding='utf-8')
+        res = self.run_tool('--help')
         self.assertEqual(res.returncode, 0)
 if __name__ == '__main__':
     unittest.main()
@@ -1587,9 +1618,871 @@ if __name__ == '__main__': unittest.main()
     shutil.rmtree(test_dir, ignore_errors=True)
 
 
+def test_r6_cli_contract_discovery_multi_arg() -> None:
+    """R6-1: Discover CLI contracts for tools with positionals and required/optional flags."""
+    from helix_core.standalone_builder import discover_cli_contract, build_smoke_args, run_smoke_tests
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir)
+    tool_file = proj_dir / "complex_cli.py"
+    tool_code = '''import sys, os, argparse
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+parser = argparse.ArgumentParser(description="Complex tool")
+parser.add_argument("src", help="Source file")
+parser.add_argument("dest", help="Destination file")
+parser.add_argument("--config", required=True, help="Path to config file")
+parser.add_argument("--count", type=int, default=1, help="Count of items")
+args = parser.parse_args()
+if not os.path.exists(args.src) or not os.path.exists(args.config) or "nonexist" in args.src or "nonexist" in args.dest:
+    sys.stderr.write("Path not found\\n")
+    sys.exit(1)
+print(f"OK src={args.src} dest={args.dest} config={args.config} count={args.count}")
+'''
+    tool_file.write_text(tool_code, encoding="utf-8")
+
+    contract = discover_cli_contract(tool_file, tool_code)
+    req_pos_names = [p["name"] for p in contract["required_positionals"]]
+    assert "src" in req_pos_names and "dest" in req_pos_names, f"Expected src and dest in required_positionals, got {req_pos_names}"
+    req_opt_names = [o["flags"][0] for o in contract["required_options"]]
+    assert "--config" in req_opt_names, f"Expected --config in required_options, got {req_opt_names}"
+    opt_opt_names = [o["flags"][0] for o in contract["optional_options"]]
+    assert "--count" in opt_opt_names, f"Expected --count in optional_options, got {opt_opt_names}"
+
+    fixture_dir = proj_dir / "fixtures"
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    args, is_table = build_smoke_args(contract, fixture_dir, "Build complex_cli with --config and --count", "complex_cli")
+    assert len(args) >= 3, f"Expected at least 2 positionals and --config, got {args}"
+    assert "--config" in args
+
+    ok, rep, fails = run_smoke_tests(proj_dir, tool_file, "complex_cli", "Build complex_cli with --config and --count")
+    assert ok, f"Smoke tests should pass with discovered contract: {fails}"
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r6_argparse_error_classified_as_harness_error() -> None:
+    """R6-1 / R6-4: Argparse usage errors classified as HARNESS_ERROR, never tool defect, tool not locked."""
+    from helix_core.quality import arbitrate_test_failure
+    test_output = "usage: tool.py [-h] --config CONFIG src dest\ntool.py: error: the following arguments are required: dest"
+    arb = arbitrate_test_failure(
+        request="Build tool that takes src dest and --config",
+        tool_code="print('tool')",
+        test_code="def test_run(self): pass",
+        test_output=test_output,
+        failing_tests=["test_run"],
+        smoke_passed=False,
+        coverage_passed=True,
+        memory_passed=True,
+        smoke_has_harness_error=True,
+    )
+    assert arb["classification"] == "HARNESS_ERROR", f"Expected HARNESS_ERROR, got {arb['classification']}"
+    assert arb["lock_tool"] is False, "Tool must NOT be locked on harness error"
+    assert "Harness built an invalid command line" in arb["reason"]
+
+
+def test_r6_scaffold_module_deterministic_helpers() -> None:
+    """R6-2: _scaffold.py module provides isolated tmp, runner, write_file, make_dir, and assertions."""
+    from helix_core.standalone_builder import write_scaffold_file
+    test_dir = tempfile.mkdtemp()
+    proj_dir = Path(test_dir)
+    scaffold_file = write_scaffold_file(proj_dir, "mytool")
+    assert scaffold_file.exists()
+
+    dummy_tool = proj_dir / "mytool.py"
+    dummy_tool.write_text('''import sys, json
+if "--fail" in sys.argv:
+    sys.stderr.write("Fatal error occurred!\\n")
+    sys.exit(2)
+if "--json" in sys.argv:
+    print(json.dumps({"status": "ok", "café": "東京"}))
+    sys.exit(0)
+print("Standard output from tool")
+''', encoding="utf-8")
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_scaffold", str(scaffold_file))
+    scaffold_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scaffold_mod)
+
+    res = scaffold_mod.run_tool()
+    assert res.returncode == 0
+    assert "Standard output from tool" in res.stdout
+
+    case = scaffold_mod.ToolTestCase()
+    case.setUp()
+    try:
+        assert case.tmp.exists()
+        f1 = case.write_file("data.txt", "hello café")
+        assert f1.read_text(encoding="utf-8") == "hello café"
+        f2 = case.write_file("data.bin", b"\\x00\\xff")
+        assert f2.read_bytes() == b"\\x00\\xff"
+        d1 = case.make_dir("subdir")
+        assert d1.is_dir()
+
+        ok_res = case.run_tool()
+        case.assertOk(ok_res)
+
+        fail_res = case.run_tool("--fail")
+        case.assertFails(fail_res)
+
+        json_res = case.run_tool("--json")
+        data = case.assertJsonOutput(json_res)
+        assert data["café"] == "東京"
+    finally:
+        case.tearDown()
+        assert not case.tmp.exists()
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r6_hygiene_static_check_rules() -> None:
+    """R6-2: Static hygiene check requires scaffold, forbids subprocess, rejects trivial assertions."""
+    from helix_core.quality import check_test_code_hygiene
+
+    bad_no_scaffold = '''import unittest
+class TestTool(unittest.TestCase):
+    def test_run(self):
+        self.assertEqual(1, 1)
+'''
+    ok, issues = check_test_code_hygiene(bad_no_scaffold, "tool", require_scaffold=True)
+    assert not ok
+    assert any("must import `ToolTestCase` from `_scaffold`" in i for i in issues)
+
+    bad_subprocess = '''from _scaffold import ToolTestCase
+import subprocess
+class TestTool(ToolTestCase):
+    def test_run(self):
+        res = subprocess.run(["python", "tool.py"])
+        self.assertEqual(res.returncode, 0)
+'''
+    ok, issues = check_test_code_hygiene(bad_subprocess, "tool", require_scaffold=True)
+    assert not ok
+    assert any("subprocess directly" in i for i in issues)
+
+    bad_assertion = '''from _scaffold import ToolTestCase
+class TestTool(ToolTestCase):
+    def test_run(self):
+        res = self.run_tool()
+        self.assertTrue(True)
+'''
+    ok, issues = check_test_code_hygiene(bad_assertion, "tool", require_scaffold=True)
+    assert not ok
+    assert any("trivial assertion" in i for i in issues)
+
+    good_test = '''from _scaffold import ToolTestCase
+class TestTool(ToolTestCase):
+    def test_run(self):
+        f = self.write_file("in.txt", "data")
+        res = self.run_tool(str(f))
+        self.assertOk(res)
+        self.assertIn("data", res.stdout)
+'''
+    ok, issues = check_test_code_hygiene(good_test, "tool", require_scaffold=True)
+    assert ok, f"Clean scaffold test should pass hygiene: {issues}"
+
+
+def test_r6_deterministic_table_alignment_checker() -> None:
+    """R6-3: Table alignment checker verifies pipe indices across header, separator, data rows."""
+    from helix_core.standalone_builder import check_table_alignment_output
+
+    aligned_table = """
+| Col A | Col B      | Score |
++-------+------------+-------+
+| 1     | Alpha      |  95.0 |
+| 2     | BetaLonger |  88.5 |
+"""
+    ok, err = check_table_alignment_output(aligned_table)
+    assert ok, f"Aligned table must pass: {err}"
+
+    misaligned_table = """
+| Col A | Col B      | Score |
++-------+------------+-------+
+| 1     | Alpha |  95.0 |
+| 2     | BetaLonger |  88.5 |
+"""
+    ok, err = check_table_alignment_output(misaligned_table)
+    assert not ok, "Misaligned table must fail"
+    assert "pipe indices" in err or "character" in err
+
+
+def test_r6_strategy_transition_table() -> None:
+    """R6-4: Explicit strategy transitions according to arbitration rules."""
+    from helix_core.quality import determine_fix_strategy
+
+    assert determine_fix_strategy("HARNESS_ERROR", lock_tool=False, smoke_ok=False, smoke_has_harness_error=True) == "regenerate_tests_only"
+    assert determine_fix_strategy("TEST", lock_tool=True, smoke_ok=True) == "regenerate_tests_only"
+    assert determine_fix_strategy("TEST", lock_tool=False, smoke_ok=True) == "regenerate_tests_only"
+    assert determine_fix_strategy("TOOL", lock_tool=False, smoke_ok=False) == "regenerate_tool_only"
+    assert determine_fix_strategy("TOOL", lock_tool=False, smoke_ok=True, covered=False) == "regenerate_tool_only"
+    assert determine_fix_strategy("TOOL", lock_tool=False, smoke_ok=True, mem_ok=False) == "regenerate_tool_only"
+    assert determine_fix_strategy("TOOL", lock_tool=False, smoke_ok=False, failing_history=[["t1"], ["t1"]], strategy_step=0) == "regenerate_tool_only"
+    assert determine_fix_strategy("TOOL", lock_tool=False, smoke_ok=False, failing_history=[["t1"], ["t1"]], strategy_step=1) == "fix"
+
+
+def test_r6_sentinel_lookup_distinguishes_null() -> None:
+    """R6-3: Sentinel object distinguishes missing key from null/0/False/empty."""
+    sentinel = object()
+    data = {"null_key": None, "zero_key": 0, "false_key": False, "empty_key": ""}
+
+    def lookup(d, k):
+        return d.get(k, sentinel)
+
+    assert lookup(data, "missing") is sentinel
+    assert lookup(data, "null_key") is None
+    assert lookup(data, "zero_key") == 0
+    assert lookup(data, "false_key") is False
+    assert lookup(data, "empty_key") == ""
+
+
 # -----------------------------------------------------------------------------
 # Runner
 # -----------------------------------------------------------------------------
+
+
+
+# -----------------------------------------------------------------------------
+# Round 7 Tests: Zero-tests-ran, colstats reproduction, reconciliation, oracles
+# -----------------------------------------------------------------------------
+
+def test_r7_zero_tests_ran_fails() -> None:
+    """R7-1: Zero tests ran or count mismatch must never count as a pass."""
+    from helix_core.quality import parse_unittest_output, count_test_methods_ast
+
+    # 1. Zero tests ran
+    zero_out = """----------------------------------------------------------------------
+Ran 0 tests in 0.000s
+
+OK"""
+    parsed_zero = parse_unittest_output(zero_out, ast_count=2, returncode=0)
+    assert not parsed_zero.success, "Zero tests ran must not count as success"
+    assert parsed_zero.status_code == "NO_TESTS_RAN"
+    assert "0 tests executed" in parsed_zero.error_message
+
+    # 2. Count mismatch (file defines 4 test methods, only 1 ran)
+    mismatch_out = """test_one (test_foo.TestFoo.test_one) ... ok
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+OK"""
+    parsed_mis = parse_unittest_output(mismatch_out, ast_count=4, returncode=0)
+    assert not parsed_mis.success, "Count mismatch must not count as success"
+    assert parsed_mis.status_code == "TEST_COUNT_MISMATCH"
+    assert "ran 1 of 4" in parsed_mis.summary_line
+
+    # 3. No tests defined in file
+    parsed_none = parse_unittest_output(zero_out, ast_count=0, returncode=0)
+    assert not parsed_none.success
+    assert parsed_none.status_code == "NO_TESTS_DEFINED"
+
+
+def test_r7_missing_main_guard_appends_and_runs() -> None:
+    """R7-1: Test file lacking unittest.main() guard is detected and auto-appended deterministically."""
+    from helix_core.quality import has_unittest_main_guard, ensure_unittest_main_guard, run_direct_test_file
+
+    code_no_guard = """import unittest
+class TestSample(unittest.TestCase):
+    def test_sample(self):
+        self.assertEqual(1 + 1, 2)
+"""
+    assert not has_unittest_main_guard(code_no_guard)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        td = Path(tmp_dir)
+        tf = td / "test_sample.py"
+        tf.write_text(code_no_guard, encoding="utf-8")
+
+        appended = ensure_unittest_main_guard(tf)
+        assert appended is True
+        assert has_unittest_main_guard(tf.read_text(encoding="utf-8"))
+
+        direct_ok, out, ran = run_direct_test_file(td, tf)
+        assert direct_ok is True
+        assert ran == 1
+        assert "Ran 1 test" in out
+
+
+def test_r7_colstats_exact_reproduction_not_passed() -> None:
+    """R7-1: Exact reproduction of the Round 6 colstats failure must yield NOT PASSED."""
+    from helix_core.quality import compute_final_status_from_disk
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        td = Path(tmp_dir)
+        # Create flawed tool (rejecting floats via isdigit and iterator consumed)
+        tool_file = td / "colstats.py"
+        tool_file.write_text("""import argparse, csv, json, sys
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('file')
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--delimiter', default=',')
+    parser.add_argument('--column')
+    args = parser.parse_args()
+    try:
+        with open(args.file, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f, delimiter=args.delimiter)
+            stats = {}
+            for col in reader.fieldnames:
+                data = [float(row[col]) for row in reader if row[col].strip().isdigit()]
+                if data:
+                    stats[col] = {'count': len(data), 'min': min(data), 'max': max(data), 'mean': sum(data)/len(data)}
+            if args.json:
+                print(json.dumps(stats))
+            else:
+                if not stats:
+                    print("No numeric columns found.")
+                    return
+                for c, s in stats.items():
+                    print(f"{c}: {s['count']}")
+    except Exception as e:
+        sys.exit(f"Error: {e}")
+
+if __name__ == '__main__':
+    main()
+""", encoding="utf-8")
+
+        # Create test file WITHOUT main guard (reproducing Round 6)
+        test_file = td / "test_colstats.py"
+        test_file.write_text("""import unittest
+import subprocess, sys
+from pathlib import Path
+
+TOOL = Path(__file__).resolve().parent / "colstats.py"
+
+class TestColstats(unittest.TestCase):
+    def test_help(self):
+        res = subprocess.run([sys.executable, str(TOOL), "--help"], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0)
+
+    def test_missing_file(self):
+        res = subprocess.run([sys.executable, str(TOOL), "missing.csv"], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_decimals(self):
+        # Flawed tool fails this test because 10.5 is not isdigit()
+        csv_p = Path(__file__).parent / "decimals.csv"
+        csv_p.write_text("val\\n10.5\\n20.5\\n", encoding="utf-8")
+        res = subprocess.run([sys.executable, str(TOOL), str(csv_p), "--json"], capture_output=True, text=True)
+        self.assertIn("10.5", res.stdout)
+""", encoding="utf-8")
+
+        status = compute_final_status_from_disk(td, "colstats", request="Build colstats with --json, --delimiter, --column")
+        assert not str(status).startswith("PASSED"), f"Colstats reproduction must NOT pass! Got: {status}"
+        assert any(k in str(status) for k in ("TESTS FAILING", "NO TESTS RAN", "REQUIREMENT FAILED", "TESTS INVALID", "COVERAGE GAP")), f"Expected failing status, got: {status}"
+
+
+def test_r7_status_reconciliation_consistency_assertion() -> None:
+    """R7-2: Builder cross-checks and assertion verifies no status string is produced inconsistent with facts."""
+    from helix_core.quality import assert_status_consistent_with_results
+
+    # Passing facts -> passes assertion
+    valid_facts = {
+        "tests_passed": True,
+        "ran_tests": 5,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "smoke_ok": True,
+        "oracle_ok": True,
+        "coverage_ok": True,
+        "alignment_ok": True,
+        "mem_ok": True,
+        "direct_run_ok": True,
+    }
+    assert_status_consistent_with_results("PASSED (all 5 tests passed)", valid_facts)
+
+    # Inconsistent status: says PASSED but smoke_ok is False -> must raise AssertionError
+    bad_smoke = dict(valid_facts, smoke_ok=False)
+    try:
+        assert_status_consistent_with_results("PASSED (all 5 tests passed)", bad_smoke)
+        assert False, "Should have raised AssertionError for bad smoke"
+    except AssertionError as ae:
+        assert "smoke_ok" in str(ae)
+
+    # Inconsistent status: says PASSED but failures > 0 -> must raise AssertionError
+    bad_fail = dict(valid_facts, failures=2)
+    try:
+        assert_status_consistent_with_results("PASSED (all 5 tests passed)", bad_fail)
+        assert False, "Should have raised AssertionError for failures"
+    except AssertionError as ae:
+        assert "failures" in str(ae)
+
+    # Inconsistent status: says PASSED but ran_tests == 0 -> must raise AssertionError
+    bad_ran = dict(valid_facts, ran_tests=0)
+    try:
+        assert_status_consistent_with_results("PASSED (all 5 tests passed)", bad_ran)
+        assert False, "Should have raised AssertionError for ran_tests == 0"
+    except AssertionError as ae:
+        assert "ran_tests" in str(ae)
+
+
+def test_r7_oracle_csv_column_stats() -> None:
+    """R7-3: Reference oracle detects float rejection and multi-column iterator exhaustion."""
+    from helix_core.quality import OracleRegistry
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        td = Path(tmp_dir)
+        # 1. Flawed tool
+        flawed_tool = td / "flawed_colstats.py"
+        flawed_tool.write_text("""import argparse, csv, json, sys
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('file')
+    parser.add_argument('--json', action='store_true')
+    args = parser.parse_args()
+    with open(args.file, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        stats = {}
+        for col in reader.fieldnames:
+            # isdigit rejects decimals!
+            data = [float(r[col]) for r in reader if r[col].strip().isdigit()]
+            if data: stats[col] = {'count': len(data), 'min': min(data), 'max': max(data), 'mean': sum(data)/len(data)}
+        print(json.dumps(stats) if args.json else "No numeric columns found.")
+if __name__ == '__main__': main()
+""", encoding="utf-8")
+
+        ok, err = OracleRegistry.oracle_csv_column_stats(flawed_tool, "Build colstats with --json", td)
+        assert not ok, "Oracle must catch flawed tool rejecting decimals / consuming reader"
+        assert "col_b" in err or "No numeric columns found" in err
+
+        # 2. Correct tool
+        good_tool = td / "good_colstats.py"
+        good_tool.write_text("""import argparse, csv, json, sys
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('file')
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--delimiter', default=',')
+    parser.add_argument('--column')
+    args = parser.parse_args()
+    with open(args.file, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f, delimiter=args.delimiter)
+        try:
+            headers = next(reader)
+        except StopIteration:
+            return
+        col_vals = {h: [] for h in headers}
+        for row in reader:
+            for i, val in enumerate(row):
+                if i < len(headers):
+                    val_str = val.strip()
+                    if val_str:
+                        try:
+                            col_vals[headers[i]].append(float(val_str))
+                        except ValueError:
+                            pass
+        stats = {}
+        target_cols = [args.column] if args.column and args.column in headers else headers
+        for h in target_cols:
+            vals = col_vals.get(h, [])
+            if vals:
+                stats[h] = {'count': len(vals), 'min': min(vals), 'max': max(vals), 'mean': sum(vals)/len(vals)}
+        if args.json:
+            print(json.dumps(stats))
+        else:
+            if not stats:
+                print("No numeric columns found.")
+                return
+            for h, s in stats.items():
+                print(f"| {h} | {s['count']} | {s['min']} | {s['max']} | {s['mean']:.2f} |")
+if __name__ == '__main__': main()
+""", encoding="utf-8")
+
+        ok_good, err_good = OracleRegistry.oracle_csv_column_stats(good_tool, "Build colstats with --json --column --delimiter", td)
+        assert ok_good, f"Good tool must pass oracle: {err_good}"
+
+
+def test_r7_oracle_dotted_path_lookup() -> None:
+    """R7-3: Reference oracle verifies dotted path lookup."""
+    from helix_core.quality import OracleRegistry
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        td = Path(tmp_dir)
+        lookup_tool = td / "query.py"
+        lookup_tool.write_text("""import json, sys
+def main():
+    with open(sys.argv[1], encoding='utf-8') as f:
+        data = json.load(f)
+    cur = data
+    for part in sys.argv[2].split('.'):
+        cur = cur[int(part)] if isinstance(cur, list) else cur[part]
+    print(cur)
+if __name__ == '__main__': main()
+""", encoding="utf-8")
+
+        ok, err = OracleRegistry.oracle_dotted_path_lookup(lookup_tool, "Build tool jsonquery to query json path", td)
+        assert ok, f"Dotted path oracle must pass on valid query tool: {err}"
+
+
+def test_r7_table_alignment_header_vs_data_width() -> None:
+    """R7-3: Table alignment checker verifies header text vs data width after truncation."""
+    from helix_core.standalone_builder import check_table_alignment_output
+
+    aligned_table = """
+| Col A | Col B      | Score |
++-------+------------+-------+
+| 1     | Alpha      |  95.0 |
+| 2     | BetaLonger |  88.5 |
+"""
+    ok, err = check_table_alignment_output(aligned_table)
+    assert ok, f"Aligned table must pass: {err}"
+
+    # Overflowing cell that exceeds column separator interval
+    overflow_table = """
+| Col A | Col B | Score |
++-------+-------+-------+
+| 1     | AlphaLongerThanWidth | 95.0 |
+"""
+    # Character position mismatch
+    ok_bad, err_bad = check_table_alignment_output(overflow_table)
+    assert not ok_bad, "Overflowing table must fail alignment check"
+
+
+def test_r7_offline_regressions() -> None:
+    """R7-4: Offline scripted regressions guarding Round 1 - Round 6 live scenarios."""
+    import subprocess
+    from helix_core.quality import classify_tool_input_kind
+    from helix_core.standalone_builder import check_table_alignment_output
+
+    # R1/R2 guard: dupefinder unicode handling under cp1252 console
+    env_cp1252 = {**dict(os.environ), "PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"}
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        td = Path(tmp_dir)
+        u_script = td / "u_test.py"
+        u_script.write_text("""import sys
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+print("café résumé naïve 日本語")
+""", encoding="utf-8")
+        res = subprocess.run([sys.executable, str(u_script)], capture_output=True, text=True, env=env_cp1252)
+        assert res.returncode == 0
+        assert "UnicodeEncodeError" not in (res.stderr or "")
+
+    # R3 guard: wordfreq empty file contract (0 bytes must exit 0, no ZeroDivisionError)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        td = Path(tmp_dir)
+        wf_script = td / "wf.py"
+        wf_script.write_text("""import sys
+with open(sys.argv[1], encoding='utf-8') as f:
+    text = f.read()
+words = text.split()
+count = len(words)
+print(count)
+""", encoding="utf-8")
+        empty_file = td / "empty.txt"
+        empty_file.write_text("", encoding="utf-8")
+        res = subprocess.run([sys.executable, str(wf_script), str(empty_file)], capture_output=True, text=True)
+        assert res.returncode == 0
+        assert res.stdout.strip() == "0"
+
+    # R4 guard: tabprint table alignment with truncated data
+    tbl = """| ID | Name    |
++----+---------+
+| 1  | Hel...  |
+"""
+    ok, _ = check_table_alignment_output(tbl)
+    assert ok
+
+    # R5/R6 guard: jsonquery / jsonget two-positional smoke arguments
+    kind = classify_tool_input_kind("Build tool jsonquery to query file.json with dotted path", "jsonquery")
+    assert kind in ("whole_document_json", "whole_document")
+
+
+
+
+# -----------------------------------------------------------------------------
+# Round 8: Hard Gate for Malformed Tests, Undefined Names & Output Modes
+# -----------------------------------------------------------------------------
+
+def test_r8_test_file_hard_validator_numstats_reproduction() -> None:
+    """R8-1: Hard validator rejects malformed test file from numstats reproduction.
+    File has leaked '# FILE: test_numstats.py' header, duplicated ToolTestCase import block,
+    markdown code fences, and undefined name references.
+    """
+    from helix_core.quality import validate_generated_test_file
+
+    malformed_test_code = """# FILE: test_numstats.py
+```python
+from _scaffold import ToolTestCase
+import unittest
+
+class TestNumstats(ToolTestCase):
+    def test_basic(self):
+        res = self.run_tool('sample.csv')
+        self.assertOk(res)
+
+from _scaffold import ToolTestCase
+from _scaffold import ToolTestCase
+
+class TestNumstatsExtra(ToolTestCase):
+    def test_extra(self):
+        res = self.run_tool('sample.csv', '--json')
+        print(undefined_variable_name_xyz)
+        self.assertOk(res)
+
+if __name__ == '__main__':
+    unittest.main()
+```
+"""
+    valid, issues, cleaned = validate_generated_test_file(
+        malformed_test_code, "numstats", "Build numstats with --json"
+    )
+    assert valid is False, "Malformed test code must be rejected by validator"
+    assert len(issues) >= 1, "Must report at least one issue"
+    has_leaked = any("leaked artifact" in i or "markdown code fence" in i for i in issues)
+    assert has_leaked, f"Expected leaked artifact detection, got: {issues}"
+    has_undef = any("undefined name 'undefined_variable_name_xyz'" in i for i in issues)
+    assert has_undef, f"Expected undefined name detection, got: {issues}"
+
+
+def test_r8_undefined_names_checker() -> None:
+    """R8-2: Undefined names checker catches missing imports, variable typos,
+    and comprehension scope leaks, while allowing builtins and conditional imports.
+    """
+    from helix_core.quality import check_undefined_names_and_imports
+
+    # 1. Missing import sys
+    code1 = """def main():
+    print(sys.executable)
+"""
+    errs1 = check_undefined_names_and_imports(code1, "test.py")
+    assert any("undefined name 'sys'" in e for e in errs1), f"Expected missing sys error, got: {errs1}"
+
+    # 2. Main guard import does NOT leak into module scope
+    code2 = """def run():
+    print(sys.executable)
+
+if __name__ == '__main__':
+    import sys
+    run()
+"""
+    errs2 = check_undefined_names_and_imports(code2, "test.py")
+    assert any("undefined name 'sys'" in e for e in errs2), f"Main guard import must not satisfy module scope: {errs2}"
+
+    # 3. Valid code with imports, builtins, and comprehensions
+    code3 = """import sys, os
+from pathlib import Path
+def compute(items):
+    squares = [x * x for x in items]
+    return {k: v for k, v in enumerate(squares)}
+"""
+    errs3 = check_undefined_names_and_imports(code3, "tool.py")
+    assert len(errs3) == 0, f"Valid code must have 0 errors, got: {errs3}"
+
+    # 4. Comprehension variable leaked outside
+    code4 = """def compute(items):
+    squares = [x * x for x in items]
+    return x  # x is not defined in function scope
+"""
+    errs4 = check_undefined_names_and_imports(code4, "tool.py")
+    assert any("undefined name 'x'" in e for e in errs4), f"Leaked comprehension variable must be caught: {errs4}"
+
+
+def test_r8_oracle_exercises_all_modes_and_catches_default_mode_crash() -> None:
+    """R8-3: Oracle exercises every output mode, starting with default mode first,
+    and catches tools that crash in default mode.
+    """
+    from helix_core.quality import OracleRegistry
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        td = Path(tmp_dir)
+
+        # Tool that works with --json but crashes in default table mode
+        flawed_tool = td / "tabstats.py"
+        flawed_tool.write_text("""import sys, os, json, argparse
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('file')
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--delimiter', default=',')
+    parser.add_argument('--column', default=None)
+    args = parser.parse_args()
+    if args.json:
+        # Returns json stats
+        data = {
+            'col_a': {'count': 3, 'min': 10.0, 'max': 30.0, 'mean': 20.0},
+            'col_b': {'count': 3, 'min': 10.5, 'max': 30.0, 'mean': 20.3333}
+        }
+        if args.column:
+            data = {args.column: data[args.column]}
+        print(json.dumps(data))
+    else:
+        # Crashes in default mode!
+        raise RuntimeError("Crash in default plain-text table mode!")
+
+if __name__ == '__main__':
+    main()
+""", encoding="utf-8")
+
+        ok, err = OracleRegistry.oracle_csv_column_stats(
+            flawed_tool,
+            "Build me a command-line tool called tabstats. It needs a --json option, --delimiter, and --column.",
+            td
+        )
+        assert ok is False, "Oracle must reject tool that crashes in default mode"
+        assert "Default mode" in err or "Crash" in err, f"Error must cite default mode crash: {err}"
+
+
+def test_r8_linecount_oracle_word_line_char_counts() -> None:
+    """R8-3: Linecount oracle checks lines, words, and characters across all modes."""
+    from helix_core.quality import OracleRegistry
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        td = Path(tmp_dir)
+
+        # 1. Correct linecount tool
+        good_tool = td / "good_linecount.py"
+        good_tool.write_text("""import sys, os, json, argparse
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('files', nargs='+')
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--sort', action='store_true')
+    parser.add_argument('--min-words', type=int, default=0)
+    args = parser.parse_args()
+
+    results = []
+    for fp in args.files:
+        if not os.path.exists(fp):
+            sys.exit(1)
+        with open(fp, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+        lines = len(text.splitlines())
+        words = len(text.split())
+        chars = len(text)
+        if words >= args.min_words:
+            results.append({'file': fp, 'lines': lines, 'words': words, 'characters': chars})
+
+    if args.sort:
+        results.sort(key=lambda r: r['words'], reverse=True)
+
+    if args.json:
+        print(json.dumps(results))
+        return
+
+    # Plain text table
+    tot_l = tot_w = tot_c = 0
+    for r in results:
+        tot_l += r['lines']; tot_w += r['words']; tot_c += r['characters']
+        fn = os.path.basename(r['file'])
+        print(f"{fn:<15} {r['lines']:>6} {r['words']:>6} {r['characters']:>6}")
+    if len(args.files) > 1:
+        print(f"{'Total':<15} {tot_l:>6} {tot_w:>6} {tot_c:>6}")
+
+if __name__ == '__main__':
+    main()
+""", encoding="utf-8")
+
+        ok1, err1 = OracleRegistry.oracle_line_word_count(
+            good_tool,
+            "Build me a command-line tool called linecount. Give it one or more text files and it prints lines, words and characters. It needs --json, --min-words N, and --sort.",
+            td
+        )
+        assert ok1 is True, f"Oracle must pass on correct linecount tool: {err1}"
+
+        # 2. Broken tool that prints wrong counts
+        bad_tool = td / "bad_linecount.py"
+        bad_tool.write_text("""import sys, os, json, argparse
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('files', nargs='+')
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--sort', action='store_true')
+    parser.add_argument('--min-words', type=int, default=0)
+    args = parser.parse_args()
+    print("file: lines 999 words 999 chars 999")
+if __name__ == '__main__': main()
+""", encoding="utf-8")
+
+        ok2, err2 = OracleRegistry.oracle_line_word_count(
+            bad_tool,
+            "Build me a command-line tool called linecount with --json and --sort.",
+            td
+        )
+        assert ok2 is False, "Oracle must reject tool with incorrect word/line/char counts"
+
+
+def test_r8_arbitration_linecount_assertion_mismatches() -> None:
+    """R8-4: Arbitration deterministically classifies assertion mismatches against valid output as TEST defects.
+    Uses the exact 4 failing assertions from Round 7 linecount.
+    """
+    from helix_core.quality import arbitrate_test_failure
+
+    test_src = """from _scaffold import ToolTestCase
+class TestLinecount(ToolTestCase):
+    def test_single_file(self):
+        res = self.run_tool('tiny_valid.json')
+        self.assertIn('18', res.stdout)
+    def test_single_file_json(self):
+        res = self.run_tool('tiny_valid.json', '--json')
+        data = self.assertJsonOutput(res)
+        self.assertEqual(data[0]['words'], 18)
+    def test_sort(self):
+        res = self.run_tool('file1.txt', 'file2.txt', '--sort')
+        lines = res.stdout.splitlines()
+        self.assertIn('file1.txt', lines[2])
+    def test_sort_json(self):
+        res = self.run_tool('file1.txt', 'file2.txt', '--sort', '--json')
+        data = self.assertJsonOutput(res)
+        self.assertEqual(data[0]['file'], 'file2.txt')
+"""
+    req = "Build linecount with --json, --min-words, --sort"
+    tool_code = "print('tiny_valid.json 1 2 16')"
+
+    # Case 1: test_single_file: '18' not found in valid output
+    arb1 = arbitrate_test_failure(
+        request=req,
+        tool_code=tool_code,
+        test_code=test_src,
+        test_output="AssertionError: '18' not found in 'tiny_valid.json 1 2 16\\n'",
+        failing_tests=["test_single_file"],
+        smoke_passed=True,
+        coverage_passed=True,
+        memory_passed=True,
+    )
+    assert arb1["classification"] == "TEST", f"Expected TEST defect, got: {arb1}"
+    assert arb1["lock_tool"] is True
+
+    # Case 2: test_single_file_json: 2 != 18
+    arb2 = arbitrate_test_failure(
+        request=req,
+        tool_code=tool_code,
+        test_code=test_src,
+        test_output="AssertionError: 2 != 18",
+        failing_tests=["test_single_file_json"],
+        smoke_passed=True,
+        coverage_passed=True,
+        memory_passed=True,
+    )
+    assert arb2["classification"] == "TEST", f"Expected TEST defect, got: {arb2}"
+    assert arb2["lock_tool"] is True
+
+    # Case 3: test_sort: 'file1.txt' not found in 'Total 2 4 24'
+    arb3 = arbitrate_test_failure(
+        request=req,
+        tool_code=tool_code,
+        test_code=test_src,
+        test_output="AssertionError: 'file1.txt' not found in 'Total     2 4 24'",
+        failing_tests=["test_sort"],
+        smoke_passed=True,
+        coverage_passed=True,
+        memory_passed=True,
+    )
+    assert arb3["classification"] == "TEST", f"Expected TEST defect, got: {arb3}"
+    assert arb3["lock_tool"] is True
+
+    # Case 4: test_sort_json: 'file1.txt' != 'file2.txt'
+    arb4 = arbitrate_test_failure(
+        request=req,
+        tool_code=tool_code,
+        test_code=test_src,
+        test_output="AssertionError: 'file1.txt' != 'file2.txt'",
+        failing_tests=["test_sort_json"],
+        smoke_passed=True,
+        coverage_passed=True,
+        memory_passed=True,
+    )
+    assert arb4["classification"] == "TEST", f"Expected TEST defect, got: {arb4}"
+    assert arb4["lock_tool"] is True
+
 
 def run_all_dev_fix_tests() -> bool:
     suites = [
@@ -1633,6 +2526,26 @@ def run_all_dev_fix_tests() -> bool:
         ("R5: Quarantine Rewrite & 25% Cap", test_r5_quarantine_rewrite_before_skip_and_cap),
         ("R5: Arbitration Option Guard", test_r5_arbitration_treats_requested_option_failure_as_tool_defect),
         ("R5: Coverage Gap Status", test_r5_coverage_gap_status_when_option_uncovered),
+        ("R6: CLI Contract Discovery Multi-Arg", test_r6_cli_contract_discovery_multi_arg),
+        ("R6: Argparse Usage Error Classified as Harness Error", test_r6_argparse_error_classified_as_harness_error),
+        ("R6: Scaffold Module Deterministic Helpers", test_r6_scaffold_module_deterministic_helpers),
+        ("R6: Hygiene Static Check Rules", test_r6_hygiene_static_check_rules),
+        ("R6: Deterministic Table Alignment Checker", test_r6_deterministic_table_alignment_checker),
+        ("R6: Strategy Transition Table", test_r6_strategy_transition_table),
+        ("R6: Sentinel Lookup Distinguishes Null", test_r6_sentinel_lookup_distinguishes_null),
+        ("R7: Zero Tests Ran & Count Mismatch Fails", test_r7_zero_tests_ran_fails),
+        ("R7: Missing Main Guard Appends and Runs", test_r7_missing_main_guard_appends_and_runs),
+        ("R7: Colstats Exact Reproduction Not Passed", test_r7_colstats_exact_reproduction_not_passed),
+        ("R7: Status Reconciliation Consistency Assertion", test_r7_status_reconciliation_consistency_assertion),
+        ("R7: Reference Oracle CSV Column Stats", test_r7_oracle_csv_column_stats),
+        ("R7: Reference Oracle Dotted Path Lookup", test_r7_oracle_dotted_path_lookup),
+        ("R7: Table Alignment Header vs Data Width", test_r7_table_alignment_header_vs_data_width),
+        ("R7: Offline Regressions R1-R6", test_r7_offline_regressions),
+        ("R8: Test File Hard Validator Reproduction", test_r8_test_file_hard_validator_numstats_reproduction),
+        ("R8: Undefined Names / Import Checker", test_r8_undefined_names_checker),
+        ("R8: Reference Oracle Output Modes & Default Mode Crash", test_r8_oracle_exercises_all_modes_and_catches_default_mode_crash),
+        ("R8: Reference Oracle Line Word Count", test_r8_linecount_oracle_word_line_char_counts),
+        ("R8: Arbitration Deterministic Linecount Assertion Mismatches", test_r8_arbitration_linecount_assertion_mismatches),
     ]
 
     print("=" * 60)

@@ -188,7 +188,7 @@ def run_python_test(
     timeout: float = 30.0,
     base_dir: Optional[Path] = None,
 ) -> str:
-    """Execute a Python test in an isolated child process."""
+    """Execute a Python test via module discovery and direct execution with summary verification."""
     root = (base_dir or HELIX_ROOT).resolve()
     raw = str(test_path).strip().strip('"').strip("'")
     p = Path(raw)
@@ -204,7 +204,7 @@ def run_python_test(
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     sep = ";" if sys.platform == "win32" else ":"
-    paths = [str(root)]
+    paths = [str(root), str(p.parent)]
     if str(HELIX_ROOT) != str(root):
         paths.append(str(HELIX_ROOT))
     existing_pp = env.get("PYTHONPATH")
@@ -212,6 +212,36 @@ def run_python_test(
         paths.append(existing_pp)
     env["PYTHONPATH"] = sep.join(paths)
 
+    has_unittest = False
+    if p.is_file():
+        try:
+            c = p.read_text(encoding="utf-8")
+            has_unittest = "unittest" in c or "ToolTestCase" in c or "def test_" in c
+        except Exception:
+            pass
+
+    is_test_file = (p.name.startswith("test_") or p.name.endswith("_test.py")) and has_unittest
+
+    if is_test_file:
+        from helix_core.quality import ensure_unittest_main_guard, run_and_parse_unittest, run_direct_test_file
+        ensure_unittest_main_guard(p)
+
+        summary = run_and_parse_unittest(p.parent, p.stem, timeout=timeout)
+        direct_ok, direct_out, direct_ran = run_direct_test_file(p.parent, p, timeout=timeout)
+
+        if not summary.success or summary.ran_count == 0 or (summary.ast_count > 0 and summary.ran_count < summary.ast_count) or not direct_ok:
+            fail_reason = summary.error_message or summary.summary_line or "Test execution failed"
+            if not direct_ok and summary.success:
+                fail_reason = f"direct execution failed (ran {direct_ran} tests)"
+            return (
+                f"TEST FAIL ({fail_reason})\n"
+                f"Stdout:\n{summary.raw_output}\n"
+                + (f"Direct Run Output:\n{direct_out}\n" if not direct_ok else "")
+            )
+
+        return f"TEST PASS\n{summary.raw_output}"
+
+    # Non-test plain script fallback
     try:
         proc = subprocess.run(
             [sys.executable, str(p)],
