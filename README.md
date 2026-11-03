@@ -317,4 +317,4 @@ Every path Helix uses is resolved relative to its own folder, so you can clone o
 
 ## License
 
-No license has been chosen yet, so by default **all rights are reserved**: you can read the code, but you are not granted permission to reuse or redistribute it. If you'd like to use Helix in your own project, please open an issue.
+Helix is released under the [MIT License](LICENSE).
