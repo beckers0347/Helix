@@ -212,9 +212,11 @@ class OllamaClient:
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
+        options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Send chat request to Ollama using live adaptive timeout."""
-        options = llm_options()
+        overrides = options or {}
+        options = llm_options(**overrides)
         eff_timeout = self.get_effective_timeout()
 
         # Try official ollama package first

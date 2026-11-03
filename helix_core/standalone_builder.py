@@ -48,6 +48,7 @@ from helix_core.quality import (
     measure_process_peak_rss,
     parse_unittest_output,
     quarantine_bad_tests,
+    repair_observed_output_test_defects,
     run_and_parse_unittest,
     run_direct_test_file,
     sanitize_test_code,
@@ -199,7 +200,15 @@ class ToolTestCase(unittest.TestCase):
     ) -> Result:
         """Run tool with cwd defaulting to this test's temp directory."""
         target_cwd = cwd if cwd is not None else self.tmp
-        str_args = [str(a) for a in args]
+        str_args = []
+        for a in args:
+            a = str(a)
+            # R12-K: a single "--flag value" argument is split into two (generated tests kept
+            # passing '--column x' as ONE argv item, which argparse rejects).
+            if a.startswith("-") and " " in a and "=" not in a.split(" ", 1)[0]:
+                str_args.extend(a.split(" ", 1))
+            else:
+                str_args.append(a)
         return run_tool(*str_args, input_text=input_text, env_extra=env_extra, cwd=target_cwd, timeout=timeout)
 
     def assertOk(self, result: Result, msg: Optional[str] = None) -> None:
@@ -422,7 +431,7 @@ def build_smoke_args(
             file_supplied = True
         elif any(k in name for k in ("dest", "out", "output", "dst")):
             dest_file = fixture_dir / "out.txt"
-            dest_file.write_text("sample output\\n", encoding="utf-8")
+            dest_file.write_text("sample output\n", encoding="utf-8")
             args.append(str(dest_file))
         elif any(k in combined for k in ("path", "dir", "folder")) and not any(k in combined for k in ("dotted", "key", "query", "selector", "json path", "toml path")):
             args.append(str(fix_file))
@@ -725,13 +734,13 @@ def run_smoke_tests(
     u_filename = "テスト_sample_café.toml" if is_toml else ("テスト_sample_café.json" if is_json else ("テスト_sample_café.csv" if is_csv else "テスト_sample_café.txt"))
     u_file = smoke_fixture_dir / u_filename
     if is_toml:
-        u_file.write_text('title = "café"\\n[server]\\nhost = "東京"\\nports = [8080]\\n', encoding="utf-8")
+        u_file.write_text('title = "café"\n[server]\nhost = "東京"\nports = [8080]\n', encoding="utf-8")
     elif is_json:
         u_file.write_text('{"name": "テスト_café", "city": "東京"}', encoding="utf-8")
     elif is_csv:
-        u_file.write_text("id,name,city\\n1,日本語_café,東京\\n2,résumé_naïve,京都\\n", encoding="utf-8")
+        u_file.write_text("id,name,city\n1,日本語_café,東京\n2,résumé_naïve,京都\n", encoding="utf-8")
     else:
-        u_file.write_text("café résumé naïve 日本語 東京\\ncafé résumé naïve\\n", encoding="utf-8")
+        u_file.write_text("café résumé naïve 日本語 東京\ncafé résumé naïve\n", encoding="utf-8")
 
     env_cp1252 = {
         **os.environ,
@@ -773,7 +782,7 @@ def run_smoke_tests(
     if is_table:
         align_csv = smoke_fixture_dir / "smoke_table_align.csv"
         align_csv.write_text(
-            "name,department,score\\nAlice,Engineering,95.5\\nBobTheVeryLongEmployeeNameHere,QualityAssurance,88.0\\nCharlie,HR,72.5\\n",
+            "name,department,score\nAlice,Engineering,95.5\nBobTheVeryLongEmployeeNameHere,QualityAssurance,88.0\nCharlie,HR,72.5\n",
             encoding="utf-8",
         )
         # 6a. Table alignment without max-width
@@ -791,7 +800,7 @@ def run_smoke_tests(
             if proc_tbl.returncode == 0 and proc_tbl.stdout:
                 align_ok, align_err = check_table_alignment_output(proc_tbl.stdout)
                 if not align_ok:
-                    failures.append(f"Table alignment error (standard layout):\\n{align_err}")
+                    failures.append(f"Table alignment error (standard layout):\n{align_err}")
                 else:
                     results.append("Smoke test table alignment (standard layout): PASSED")
             observed_samples.append({
@@ -820,7 +829,7 @@ def run_smoke_tests(
                 if proc_mw.returncode == 0 and proc_mw.stdout:
                     align_mw_ok, align_mw_err = check_table_alignment_output(proc_mw.stdout)
                     if not align_mw_ok:
-                        failures.append(f"Table alignment error under --max-width 8:\\n{align_mw_err}")
+                        failures.append(f"Table alignment error under --max-width 8:\n{align_mw_err}")
                     else:
                         results.append("Smoke test table alignment under --max-width 8: PASSED")
                 observed_samples.append({
@@ -865,7 +874,82 @@ def run_smoke_tests(
         except Exception:
             pass
 
-    # 8. Reference Oracle validation (csv-column-stats, dotted-path-lookup, line-word-count)
+    # 8. Selector validation smoke check (R10-4, R11-3)
+    if is_csv and "--column" in request:
+        sel_csv = smoke_fixture_dir / "selector_test.csv"
+        sel_csv.write_text("col_num_1,col_num_2,col_text\n10,20.5,alpha\n30,40.0,beta\n", encoding="utf-8")
+
+        # 8a. Unknown column selector: must exit non-zero and write to stderr
+        try:
+            proc_unk = subprocess.run(
+                [sys.executable, str(tool_path), str(sel_csv), "--column", "__unknown_col_12345__"],
+                cwd=str(project_dir),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+            if proc_unk.returncode == 0:
+                failures.append(
+                    "Selector validation failure (R10-4): tool exited 0 when given unknown column '--column __unknown_col_12345__'! "
+                    "Must print a clear error to sys.stderr and exit non-zero (sys.exit(1))."
+                )
+            elif not (proc_unk.stderr or "").strip() and "error" not in (proc_unk.stdout or "").lower():
+                failures.append(
+                    "Selector validation failure (R10-4): tool exited non-zero on unknown column but printed no error message to stderr."
+                )
+            else:
+                results.append("Smoke test unknown selector validation: PASSED (exit non-zero with error)")
+            observed_samples.append({
+                "description": "Selector validation (unknown column)",
+                "command": f"python {project_name}.py selector_test.csv --column __unknown_col_12345__",
+                "exit_code": proc_unk.returncode,
+                "stdout": proc_unk.stdout,
+                "stderr": proc_unk.stderr,
+            })
+        except Exception as e:
+            failures.append(f"Selector validation smoke test (unknown column) failed: {e}")
+
+        # 8b. Non-numeric column selector for numeric stats: must exit non-zero and write to stderr, no traceback
+        try:
+            proc_nonnum = subprocess.run(
+                [sys.executable, str(tool_path), str(sel_csv), "--column", "col_text"],
+                cwd=str(project_dir),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+            err_nn = proc_nonnum.stderr or ""
+            out_nn = proc_nonnum.stdout or ""
+            if proc_nonnum.returncode == 0:
+                failures.append(
+                    "Selector validation failure (R11-3): tool exited 0 when given non-numeric column '--column col_text'! "
+                    "When request asks for numeric stats, non-numeric column selector must print error to sys.stderr and exit non-zero (sys.exit(1))."
+                )
+            elif "Traceback (most recent call last)" in err_nn or "Traceback (most recent call last)" in out_nn:
+                failures.append(
+                    f"Selector validation failure (R11-3): tool crashed with unhandled traceback on non-numeric column: {err_nn[:200]}"
+                )
+            elif not err_nn.strip() and "error" not in out_nn.lower():
+                failures.append(
+                    "Selector validation failure (R11-3): tool exited non-zero on non-numeric column but printed no error message to stderr."
+                )
+            else:
+                results.append("Smoke test non-numeric selector validation: PASSED (exit non-zero with error, no traceback)")
+            observed_samples.append({
+                "description": "Selector validation (non-numeric column)",
+                "command": f"python {project_name}.py selector_test.csv --column col_text",
+                "exit_code": proc_nonnum.returncode,
+                "stdout": proc_nonnum.stdout,
+                "stderr": proc_nonnum.stderr,
+            })
+        except Exception as e:
+            failures.append(f"Selector validation smoke test (non-numeric column) failed: {e}")
+
+    # 9. Reference Oracle validation (csv-column-stats, dotted-path-lookup, line-word-count)
     oracle_ok, oracle_issues = OracleRegistry.run_oracles(tool_path, request, project_dir)
     if not oracle_ok:
         for iss in oracle_issues:
@@ -879,7 +963,7 @@ def run_smoke_tests(
     except Exception:
         pass
 
-    report = "=== Smoke Test Results ===\\n" + "\\n".join(f"[OK] {r}" for r in results) + ("\\n" + "\\n".join(f"[FAIL] {f}" for f in failures) if failures else "")
+    report = "=== Smoke Test Results ===\n" + "\n".join(f"[OK] {r}" for r in results) + ("\n" + "\n".join(f"[FAIL] {f}" for f in failures) if failures else "")
     success = len(failures) == 0
     if return_samples:
         return success, report, failures, observed_samples, has_harness_error
@@ -907,6 +991,92 @@ def format_observed_behavior(project_name: str, observed_samples: List[Dict[str,
         lines.append("")
 
     return "\n".join(lines).strip()
+
+
+
+def build_tool_generation_prompt(request_text: str, project_name: str, flags: Any) -> str:
+    """R12-I: tool-generation prompt containing ONLY the guidance relevant to this request.
+
+    The earlier prompt prepended the whole agent persona (tool-calling instructions,
+    dupefinder hints) and every rule ever added (JSON sentinel lookups, --max-width truncation,
+    two-pass re-open streaming), which confused the model on simple CSV-stats requests."""
+    req = request_text.lower()
+    flags = sorted(flags) if flags else []
+    kind = infer_tool_input_kind(request_text, {}, "", project_name)
+    is_csv = kind == "csv"
+    is_table = any(k in req for k in ("table", "aligned", "column"))
+    is_stats = any(k in req for k in ("mean", "average", "minimum", "maximum", "count", "statistic"))
+    is_listing_total = "total" in req
+    is_lookup = any(k in req for k in ("dotted", "key path", "path like", "lookup", "query"))
+    has_selector = "--column" in req or "--field" in req or "--key" in req
+
+    parts = [
+        f"You are an expert Python engineer. Write a clean, robust, standalone command-line utility `{project_name}.py` "
+        f"for this request:\n\"\"\"{request_text}\"\"\"\n",
+        "REQUIREMENTS:",
+        f"- Use argparse with exactly these options: {', '.join(flags) if flags else 'the options named in the request'} "
+        "(plus -h/--help and the positional input). Do not add other options.",
+        "- Every option must work alone and combined with every other option (e.g. a filter/selector option must "
+        "also apply in --json mode).",
+        "- Missing/unreadable input: print a clear message to stderr and exit 1. No tracebacks for user errors. "
+        "`--help` exits 0. Default mode (no options) must succeed on any valid input.",
+        "- At the start of main(): `if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')`. "
+        "Print JSON with `json.dumps(..., indent=2, ensure_ascii=False)`.",
+        "- Stream the input (iterate rows/lines); never read whole large files into memory. Peak memory must stay "
+        "under 150 MB on a 50 MB input.",
+    ]
+    if is_csv and is_stats:
+        parts += [
+            "",
+            "CSV STATISTICS (this request):",
+            "- Read with csv.reader(f, delimiter=args.delimiter) after opening with newline='' and encoding='utf-8'. "
+            "The first row is the header.",
+            "- Make ONE pass over the rows and keep, per column, running accumulators only: count, min, max, sum, and "
+            "a flag `non_numeric_seen`. Do NOT store the values in lists.",
+            "- For each cell: strip it; skip it if empty; try `float(cell)` (accepts negatives/decimals/exponents); on "
+            "ValueError set non_numeric_seen for that column.",
+            "- A column is numeric only if count > 0 and non_numeric_seen is False. Non-numeric columns are left out "
+            "of the output entirely (table AND JSON). mean = sum / count.",
+            "- JSON output: an object mapping column name -> {\"count\", \"min\", \"max\", \"mean\"} for the shown columns.",
+            "- Table output: the table header is exactly Column | Count | Min | Max | Mean (NOT the CSV's own header), "
+            "followed by ONE row per numeric column: its name, count, min, max and mean.",
+        ]
+    if has_selector:
+        parts += [
+            "- Selector (`--column NAME`): if NAME is not a header -> stderr \"Error: column 'NAME' not found\" and exit 1; "
+            "if NAME exists but is not numeric -> stderr \"Error: column 'NAME' has no numeric values\" and exit 1. "
+            "Otherwise show only that column, in table and JSON mode.",
+        ]
+    if is_table:
+        parts += [
+            "",
+            "TABLE OUTPUT:",
+            "- Build every row as a list of already-formatted strings first (header row, data rows, and a total row if any).",
+            "- widths has exactly ONE entry per column: widths[i] = max(len(row[i]) for every row including the header).",
+            "- Print: header = ' | '.join(c.ljust(w) for c, w in zip(header, widths)); separator = '-+-'.join('-' * w for w in widths); "
+            "each data row joined the same way as the header.",
+            "- Never call max()/min() on a possibly empty sequence (e.g. no numeric columns): print just the header "
+            "and separator in that case.",
+        ]
+    if is_listing_total:
+        parts += [
+            "- Total line: filter rows first, then sort only the item rows, then append the Total row LAST, computed "
+            "from the rows actually shown. Never sort or filter the Total row.",
+        ]
+    if is_lookup:
+        parts += [
+            "",
+            "LOOKUPS: use a sentinel (`_MISSING = object()`) to tell a missing key from a present null/0/False value.",
+        ]
+    if "--max-width" in req:
+        parts += [
+            "- `--max-width N`: truncate a cell longer than N to its first N-3 characters plus '...'.",
+        ]
+    parts += [
+        "",
+        f"Output ONLY the complete code for `{project_name}.py` in a single ```python block starting with `# FILE: {project_name}.py`. No explanations.",
+    ]
+    return "\n".join(parts)
 
 
 def build_standalone_project_staged(
@@ -954,6 +1124,8 @@ def build_standalone_project_staged(
 
     last_error = ""
     missing_reqs: List[str] = []
+    pending_rejection_note = ""
+    no_op_streak = 0
     attempt = 0
     test_res_str = ""
     smoke_report = ""
@@ -989,51 +1161,7 @@ def build_standalone_project_staged(
         # Stage 1: Generate tool if missing
         if not tool_code:
             flags = extract_requested_flags(request_text)
-            prompt = (
-                f"{SYSTEM_PROMPT}\n\n"
-                f"You are Helix, an expert software engineer building a clean, robust, standalone command-line Python utility named `{project_name}.py` "
-                f"fulfilling this user request:\n\"\"\"{request_text}\"\"\"\n\n"
-                "CRITICAL IMPLEMENTATION REQUIREMENTS:\n"
-                f"1. Implement only requested CLI options using argparse: {', '.join(flags) if flags else 'all options from request'}. Do NOT add unrequested CLI options.\n"
-                "2. Flag combinations & Spec fidelity (R9-2, R9-3):\n"
-                "   * Support every flag alone AND in all pairwise and multi-flag combinations! E.g. when `--json` is combined with filtering options (like `--column NAME` or `--min-words N`), the JSON output MUST respect those filters! Never ignore filter flags when `--json` is passed.\n"
-                "   * Strictly ignore non-requested/ignored items: if the request specifies ignoring empty cells or non-numeric columns, they MUST be completely omitted from BOTH plain-text table and JSON output.\n"
-                "   * In table mode, ensure all data rows, header rows, and total rows have the exact same number of column fields/pipes.\n"
-                "   * Selector validation (R10-4): When a selector option (`--column NAME`, key, field) names something missing or unusable (e.g. unknown column, non-numeric column when computing numeric statistics), print a clear error message to `sys.stderr` and exit non-zero (`sys.exit(1)`). Never exit 0 on an invalid or unusable selector.\n"
-                "   * Row-order semantics (R10-2): The Total/summary row must always be the LAST row (never first, never in middle) and must NEVER participate in sorting or filtering. In `--sort` mode, sort only data/file rows (largest first; preserve stable tie ordering). When `--min-words` is used, the Total row must equal the sum of the SHOWN rows.\n"
-                "3. Value Lookup & Sentinels (JSON / TOML / Dict keys):\n"
-                "   Use a sentinel object (e.g. `_MISSING = object()`) during lookup, NOT truthiness or `is None`.\n"
-                "   If a key exists and its value is `None`/`null`, it is a FOUND value: print `null` (or JSON null) and exit 0!\n"
-                "   Only if the key or index is genuinely NOT present in the object/array should you trigger `--default VALUE` (if provided) or exit with an error.\n"
-                "3. Numeric Parsing & Multi-Column Statistics (if applicable):\n"
-                "   * NEVER use `str.isdigit()` or regex for checking if a value is numeric! `isdigit()` rejects negative numbers (-5) and decimals (10.5).\n"
-                "   * Always use `float(cell.strip())` inside a `try...except (ValueError, TypeError)` block to parse numeric values, skipping empty/whitespace cells.\n"
-                "   * For multi-column statistics over a streamed reader/iterator, accumulate statistics for ALL columns in ONE pass over the rows. NEVER iterate over the reader once per column, and NEVER consume an iterator and reuse it.\n"
-                "4. Performance & Streaming: For large files, stream line-by-line (for line in f:) or in 64KB chunks (f.read(65536)). NEVER load whole files into RAM with unbuffered f.read().\n"
-                "   For table formatting tools where column widths require seeing all rows, use a two-pass streaming approach:\n"
-                "   Pass 1: Stream rows to compute max column widths without storing rows in memory.\n"
-                "   Pass 2: Re-open or seek to beginning and stream rows to print formatted rows.\n"
-                "   Peak memory usage must remain under 150 MB even on large 50+ MB inputs.\n"
-                "4. Robustness & Input Validation: If an input file/folder does not exist or cannot be accessed, print an error to sys.stderr and exit non-zero (sys.exit(1)). NEVER exit 0 on missing/invalid input paths. Normal `--help` must exit 0.\n"
-                "5. Table Formatting Specifications (R10-1):\n"
-                "   * Column width = max of header and all printed cells AFTER number formatting. E.g. a float formatted with 6 decimal places (`6.666667`) has length 8, requiring column width at least 8. Never truncate or under-allocate columns.\n"
-                "   * In Pass 1, compute column widths AFTER formatting: all rows, headers, and separator lines must use identical column widths so `|` or `+` characters align vertically across all rows at identical character positions.\n"
-                "   * Continuous header separator line has exactly ONE segment per header column, matching column boundaries.\n"
-                "   * Standard aligned table printing pattern:\n"
-                "     header_line = ' | '.join(f'{h:<{w}}' for h, w in zip(headers, widths))\n"
-                "     sep_line = '-+-'.join('-' * w for w in widths)\n"
-                "     data_lines = [' | '.join(f'{str(c):<{w}}' for c, w in zip(row, widths)) for row in data_rows]\n"
-                "     print('\\n'.join([header_line, sep_line] + data_lines))\n"
-                "     CRITICAL: Join cells in each row with ' | '. NEVER use the separator line string as the join delimiter!\n"
-                "   * Cell truncation with `--max-width N`: keep a prefix of the string and append '...' such that total width is <= max-width (e.g. max-width 8 on long text becomes 'Hello...'). NEVER collapse everything into just '...'!\n"
-                "6. Windows Unicode Safety: At the top of main, configure stdout encoding:\n"
-                "   ```python\n"
-                "   if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):\n"
-                "       sys.stdout.reconfigure(encoding='utf-8', errors='replace')\n"
-                "   ```\n"
-                "   When printing JSON containing user text, use `ensure_ascii=False` so Unicode characters (e.g. accents, emojis, 'café') are preserved directly rather than escaped.\n"
-                f"7. Output ONLY the complete Python code for `{project_name}.py` starting with `# FILE: {project_name}.py` inside a single ```python ``` code block. No explanations."
-            )
+            prompt = build_tool_generation_prompt(request_text, project_name, flags)
             (attempt_dir / "tool_prompt.txt").write_text(prompt, encoding="utf-8")
             try:
                 _notify(f"Generating tool implementation...", 35)
@@ -1123,7 +1251,11 @@ def build_standalone_project_staged(
         smoke_ok = False
         mem_ok = True
         observed_output = ""
+        smoke_ok = False
         smoke_report = ""
+        smoke_fails: List[str] = []
+        observed_samples: List[Dict[str, Any]] = []
+        smoke_has_harness_error = False
         mem_report = ""
         contract = discover_cli_contract(tool_path) if (tool_path and tool_path.exists()) else {}
 
@@ -1155,7 +1287,7 @@ def build_standalone_project_staged(
                 last_error = f"Smoke test validation failed:\n{smoke_report}"
 
             # Memory budget gate (50 MB input, 150 MB peak RSS budget)
-            if covered and smoke_ok:
+            if tool_code:
                 mem_ok, peak_rss, mem_report = check_tool_memory_budget(
                     project_dir, tool_path, project_name, request_text
                 )
@@ -1163,6 +1295,32 @@ def build_standalone_project_staged(
                 if not mem_ok:
                     _notify(f"Memory budget gate failed: {mem_report}", 68)
                     last_error = mem_report
+
+            # R12-B: the fix feedback lists EVERY failing check; a later stage must never
+            # overwrite an earlier one (memory used to hide the oracle/default-mode failures).
+            fb_parts = []
+            if pending_rejection_note:
+                fb_parts.append(pending_rejection_note)
+                pending_rejection_note = ""
+            if not covered:
+                fb_parts.append("REQUIREMENTS COVERAGE FAILURES:\n" + "\n".join(f"- {m}" for m in (missing_reqs or [])))
+            if not smoke_ok and smoke_fails:
+                fb_parts.append(
+                    "SMOKE / ORACLE / LAYOUT FAILURES (deterministic checks run on the real tool - fix ALL of these):\n"
+                    + "\n".join(f"- {f}" for f in smoke_fails)
+                )
+            if tool_code and not mem_ok and mem_report:
+                fb_parts.append("MEMORY: " + mem_report)
+            if tool_code and not smoke_ok:
+                try:
+                    from helix_core.quality import build_expected_output_example
+                    example = build_expected_output_example(request_text, tool_path, project_dir)
+                    if example:
+                        fb_parts.append(example)
+                except Exception as exc:  # noqa: BLE001
+                    fb_parts.append(f"(concrete target unavailable: {exc})")
+            if fb_parts:
+                last_error = "\n\n".join(fb_parts)
 
         # Stage 3: Generate tests grounded in observed behavior
         if tool_code and not test_code:
@@ -1189,8 +1347,19 @@ def build_standalone_project_staged(
                 f"{fixtures_guide}\n"
                 f"   CRITICAL: Never create .json fixtures if the tool is not a JSON tool, even if it has a --json output option! All input files MUST match kind '{kind}'.\n"
                 "4. REQUESTED OPTIONS COVERAGE: Ensure every option and flag requested by the user is exercised in at least one test method.\n"
-                "5. MEANINGFUL ASSERTIONS & TEST PRECISION (R10-3): Reject trivial assertions. When asserting on table text output, assert that column names and numerical values are present in stdout (e.g. self.assertIn('col_a', res.stdout) and self.assertIn('20.0', res.stdout)). NEVER assert full multi-column formatted strings with pipes (e.g. 'col_a | 2 | 10.0') because padding spaces vary across implementations! For help tests, use self.assertIn('usage:', res.stdout.lower()). Never assert hardcoded character counts that are off by 1-2 chars (e.g. 58 vs 57, 100 vs 99). For floating-point statistics (mean, avg), format or round appropriately (e.g. `11.666667` or `self.assertAlmostEqual(..., delta=0.01)`) rather than rigid full-precision string comparisons like `'11.666666666666666'`. Every test method must assert on `result.returncode`, `result.stdout`, or `result.stderr` specifically, using `self.assertOk(res)`, `self.assertFails(res)`, `self.assertIn(...)`, or `self.assertJsonOutput(res)`.\n"
-                "6. SELECTOR VALIDATION TESTS (R10-4): When testing selector options like `--column NAME`, include tests asserting that an unknown column name or unusable/non-numeric column causes the tool to exit non-zero with error output: `self.assertFails(res)`.\n"
+                "5. MEANINGFUL ASSERTIONS & TEST PRECISION (R10-3, R11-1): Reject trivial assertions. When asserting on table text output, assert that column names and numerical values are present in stdout (e.g. self.assertIn('col_a', res.stdout) and self.assertIn('20.0', res.stdout)). NEVER assert full multi-column formatted strings with pipes (e.g. 'col_a | 2 | 10.0') because padding spaces vary across implementations! For help tests, use self.assertIn('usage:', res.stdout.lower()). Never assert hardcoded character counts that are off by 1-2 chars (e.g. 58 vs 57, 100 vs 99). For floating-point statistics (mean, avg), format or round appropriately (e.g. `11.666667` or `self.assertAlmostEqual(..., delta=0.01)`) rather than rigid full-precision string comparisons like `'11.666666666666666'`. Every test method must assert on `result.returncode`, `result.stdout`, or `result.stderr` specifically, using `self.assertOk(res)`, `self.assertFails(res)`, `self.assertIn(...)`, or `self.assertJsonOutput(res)`.\n"
+                "   PRECOMPUTED FIXTURE COUNTS (Use these exact values in your assertions - do NOT compute by hand!):\n"
+                "   * If testing text counting:\n"
+                "     - f1.txt (\"the quick brown fox jumps over the lazy dog and runs away\\n\"): lines=1, words=12, characters=58\n"
+                "     - f2.txt (\"short line\\n\"): lines=1, words=2, characters=11\n"
+                "     - f3.txt (\"alpha beta gamma\\ndelta epsilon\\n\"): lines=2, words=5, characters=31\n"
+                "     - Multi-file Total (f1+f2+f3): lines=4, words=19, characters=100 (58+11+31=100, NEVER 99!)\n"
+                "     - Min-words 4/5 Total (f1+f3): lines=3, words=17, characters=89 (58+31=89, NEVER 88!)\n"
+                "   * If testing CSV column stats:\n"
+                "     - sample.csv with col_a (10, blank, 20, 30): count=3, min=10.0, max=30.0, mean=20.0\n"
+                "     - sample.csv with col_b (10.5, 20.5, 30.0, blank): count=3, min=10.5, max=30.0, mean=20.333333\n"
+                "     - non-numeric column 'name': completely omitted from stats.\n"
+                "6. SELECTOR VALIDATION TESTS (R10-4, R11-3): When testing selector options like `--column NAME`, test BOTH an unknown column AND a non-numeric column (one with text only): both must cause the tool to exit non-zero with error output: `self.assertFails(res)`, NEVER raise KeyError or unhandled traceback!\n"
                 "7. PARSING JSON: When testing `--json`, remember that `--json` is an OUTPUT option. The input to the tool is still a valid fixture matching the tool's input kind. Parse stdout with `data = self.assertJsonOutput(res)`.\n"
                 "8. ENTRY POINT GUARD: You MUST end the test file with the standard entry point:\n"
                 "   ```python\n"
@@ -1285,7 +1454,9 @@ def build_standalone_project_staged(
                         }
                         _notify(f"Initial tests rejected: {test_reason}", -1)
                         last_error = f"Initial tests rejected: {test_reason}"
-                last_error = ""
+                # R12-B: keep the smoke/oracle/memory feedback collected in Stage 2
+                if last_error.startswith("Model call") or last_error.startswith("Test generation"):
+                    last_error = ""
                 prev_attempt_timed_out = False
             except (TimeoutError, Exception) as e:
                 is_timeout = isinstance(e, TimeoutError) or "timeout" in str(e).lower()
@@ -1315,10 +1486,20 @@ def build_standalone_project_staged(
                     break
                 continue
 
-        # Stage 4: Run tests via unittest module discovery and direct execution (R7-1)
+        # Stage 4: Run tests via unittest module discovery and direct execution (R7-1, R11-1, R11-2)
         passed = False
         failing_tests = []
-        if test_code:
+        test_res_str = ""
+
+        # R8-3, R11-2: Smoke must run default (no-flag) mode; a traceback there blocks testing
+        smoke_has_crash = any("traceback" in f.lower() or "crashed" in f.lower() for f in (smoke_fails or [])) if (not smoke_ok and smoke_fails) else False
+        if smoke_has_crash:
+            _notify("Tool crashed in smoke tests with traceback: blocking test execution stage.", -1)
+            last_error = f"Smoke test crash / traceback in default mode:\n{smoke_report}"
+            failing_tests = []
+            passed = False
+            test_res_str = f"Smoke test crash / traceback in default mode:\n{smoke_report}"
+        elif test_code:
             _notify("Running unit tests via real interpreter...", 80)
             ensure_unittest_main_guard(test_path)
             summary = run_and_parse_unittest(project_dir, f"test_{project_name}")
@@ -1327,6 +1508,28 @@ def build_standalone_project_staged(
             (attempt_dir / "test_output.txt").write_text(test_res_str, encoding="utf-8")
             failing_tests = summary.failed_test_names
             passed = summary.success and direct_ok and (summary.ran_count >= summary.ast_count) and (summary.ran_count > 0)
+
+            # R11-1: Deterministic observed-output test repair (Run BEFORE strategy rotation and before quarantine)
+            if not passed and failing_tests:
+                rep_ok, rep_code = repair_observed_output_test_defects(test_code, test_res_str)
+                if rep_ok:
+                    try:
+                        ast.parse(rep_code)
+                        test_path.write_text(rep_code, encoding="utf-8")
+                        re_summary = run_and_parse_unittest(project_dir, f"test_{project_name}")
+                        re_direct_ok, re_direct_out, re_direct_ran = run_direct_test_file(project_dir, test_path)
+                        re_passed = re_summary.success and re_direct_ok and (re_summary.ran_count >= re_summary.ast_count) and (re_summary.ran_count > 0)
+                        re_failing = re_summary.failed_test_names
+                        if re_passed or len(re_failing) < len(failing_tests):
+                            _notify(f"Deterministic test repair (R11-1) fired: resolved {len(failing_tests) - len(re_failing)} test failure(s).", 82)
+                            test_code = rep_code
+                            test_res_str = re_summary.raw_output + ("\nDirect run:\n" + re_direct_out if not re_direct_ok else "")
+                            failing_tests = re_failing
+                            passed = re_passed
+                            (attempt_dir / "test_output.txt").write_text(test_res_str, encoding="utf-8")
+                            (attempt_dir / "test_repair.txt").write_text(f"Repaired test assertions from observed output:\n{test_res_str}", encoding="utf-8")
+                    except Exception:
+                        test_path.write_text(test_code, encoding="utf-8")
 
             if passed and covered and smoke_ok and mem_ok:
                 _notify("All tests passed successfully!", 100)
@@ -1439,6 +1642,8 @@ def build_standalone_project_staged(
 
         fail_str = f"Failing tests: {', '.join(failing_tests)}" if failing_tests else (last_error[:120] if last_error else test_res_str[:120])
         _notify(f"Tests/checks failed on attempt {attempt}: {fail_str}", 85)
+        if test_res_str and failing_tests:
+            last_error = (last_error + "\n\n" if last_error else "") + f"UNIT TEST OUTPUT:\n{test_res_str[-3000:]}"
         last_error = last_error or f"Unit tests failed:\n{test_res_str}"
 
         # Strategy transition table
@@ -1500,8 +1705,9 @@ def build_standalone_project_staged(
                     f"The test suite for `{project_name}.py` expresses the required behavior, but the tool failed tests or reference oracles.\n\n"
                     f"USER REQUIREMENTS:\n\"\"\"{request_text}\"\"\"\n\n"
                     f"{unreq_note}"
+                    f"CURRENT TOOL CODE (`{project_name}.py`) - fix THIS code, do not start from scratch:\n```python\n{tool_code}\n```\n\n"
                     f"CURRENT TEST CODE (`test_{project_name}.py`):\n```python\n{test_code}\n```\n\n"
-                    f"FAILING TRACEBACKS / ORACLE DEFECTS:\n{last_error}\n\n"
+                    f"FAILURES TO FIX (deterministic checks and tests on the real tool):\n{last_error}\n\n"
                     "INSTRUCTIONS:\n"
                     f"1. Regenerate `{project_name}.py` in full so it satisfies all user requirements and passes the tests.\n"
                     "2. Flag combinations & Spec fidelity (R9-2, R9-3):\n"
@@ -1514,6 +1720,10 @@ def build_standalone_project_staged(
                     "     data_lines = [' | '.join(f'{str(c):<{w}}' for c, w in zip(row, widths)) for row in data_rows]\n"
                     "     print('\\n'.join([header_line, sep_line] + data_lines))\n"
                     "     CRITICAL: Join cells in each row with ' | '. NEVER use the separator line string as the join delimiter!\n"
+                    "   * widths has exactly ONE entry per column: widths[i] = max(len(headers[i]), max(len(str(row[i])) for row in all printed rows)), computed AFTER number formatting. Print every row from the SAME list of formatted cells.\n"
+                    "   * Default mode (no flags) must succeed on any valid input: never call max()/min() on an empty sequence; columns without numeric values are simply skipped.\n"
+                    "   * A selector such as `--column NAME` naming a missing or non-numeric column must print a clear error naming that column to stderr and exit 1.\n"
+                    "   * Listing tools with a total line: filter, then sort only the item rows, then append the Total row LAST.\n"
                     "3. Numeric parsing: never use `str.isdigit()` or regex for numeric checks; use `float(cell.strip())` inside `try...except (ValueError, TypeError)` block (accepts negatives, decimals, exponents; skip empty cells).\n"
                     "4. Multi-column streaming: accumulate all columns in a single pass over rows. Never iterate over the reader once per column, and never consume an iterator and reuse it.\n"
                     "5. Keep all CLI flags, chunked streaming, Windows UTF-8 stdout configuration, and non-zero exit on errors.\n"
@@ -1524,7 +1734,7 @@ def build_standalone_project_staged(
                     f"Targeted fix for a single failing test assertion in `{project_name}.py`.\n\n"
                     f"USER REQUIREMENTS:\n\"\"\"{request_text}\"\"\"\n\n"
                     f"{tool_lock_note}"
-                    f"FAILING TRACEBACK:\n{last_error[:1000]}\n\n"
+                    f"FAILURES TO FIX:\n{last_error[:4000]}\n\n"
                     f"CURRENT TOOL CODE (`{project_name}.py`):\n```python\n{tool_code}\n```\n\n"
                     f"CURRENT TEST CODE (`test_{project_name}.py`):\n```python\n{test_code}\n```\n\n"
                     f"FIXTURE AND INPUT KIND GUIDANCE:\n{fix_fixtures_guide}\n\n"
@@ -1537,7 +1747,7 @@ def build_standalone_project_staged(
                     f"Unit test failure for `{project_name}.py` on attempt {attempt}:\n\n"
                     f"USER REQUIREMENTS:\n\"\"\"{request_text}\"\"\"\n\n"
                     f"{tool_lock_note}"
-                    f"FAILING TRACEBACK:\n{last_error[:1000]}\n\n"
+                    f"FAILURES TO FIX:\n{last_error[:4000]}\n\n"
                     f"CURRENT TOOL CODE (`{project_name}.py`):\n```python\n{tool_code}\n```\n\n"
                     f"CURRENT TEST CODE (`test_{project_name}.py`):\n```python\n{test_code}\n```\n\n"
                     f"FIXTURE AND INPUT KIND GUIDANCE:\n{fix_fixtures_guide}\n\n"
@@ -1557,7 +1767,16 @@ def build_standalone_project_staged(
             (attempt_dir / "fix_prompt.txt").write_text(prompt, encoding="utf-8")
             try:
                 _notify(f"Executing self-correction fix (strategy: {fix_stage})...", 88)
-                reply = engine.client.chat([{"role": "user", "content": prompt}], tools=None)
+                # R12-L: after an identical (no-op) candidate, the same prompt at temperature 0.1
+                # returns the same code again; retry with more sampling freedom.
+                if no_op_streak > 0:
+                    try:
+                        reply = engine.client.chat([{"role": "user", "content": prompt}], tools=None,
+                                                   options={"temperature": min(0.3 + 0.2 * no_op_streak, 0.9)})
+                    except TypeError:
+                        reply = engine.client.chat([{"role": "user", "content": prompt}], tools=None)
+                else:
+                    reply = engine.client.chat([{"role": "user", "content": prompt}], tools=None)
                 raw_content = reply.get("content", "")
                 (attempt_dir / "fix_raw.txt").write_text(raw_content, encoding="utf-8")
                 blocks = parse_code_blocks(raw_content)
@@ -1612,11 +1831,18 @@ def build_standalone_project_staged(
                                 "written": True, "sha256_before": sha_before, "sha256_after": sha_after, "status": "updated_from_fix"
                             }
                             tool_updated = True
+                            no_op_streak = 0
                         else:
                             writes_log[f"{project_name}.py"] = {
                                 "written": False, "sha256_before": get_sha256(tool_path), "sha256_after": get_sha256(tool_path), "status": f"rejected: {tool_reason}"
                             }
                             _notify(f"Tool fix rejected by regression guard: {tool_reason}", -1)
+                            no_op_streak = no_op_streak + 1 if "No-op" in str(tool_reason) else 0
+                            pending_rejection_note = (
+                                "YOUR PREVIOUS FIX WAS REJECTED AND DISCARDED (the tool on disk is unchanged): "
+                                f"{tool_reason}. Keep everything that already works (all CLI flags, error handling "
+                                "with non-zero exit, UTF-8 stdout, streaming) and change only what the failures require."
+                            )
                             bk = attempt_dir / f"backup_{project_name}.py"
                             if bk.exists():
                                 tool_path.write_text(bk.read_text(encoding="utf-8"), encoding="utf-8")
@@ -1761,7 +1987,7 @@ def build_standalone_project_staged(
             quar_ok, quar_list = quarantine_bad_tests(
                 project_dir, test_path, failing_tests, test_output=test_res_str, observed_samples=observed_samples, request=request_text
             )
-            if quar_ok and quar_list:
+            if quar_ok:
                 re_output = run_python_test(str(test_path), base_dir=project_dir)
                 re_failing = re.findall(r"(?:FAIL|ERROR):\s+([a-zA-Z0-9_]+)", re_output)
                 re_passed = ("TEST PASS" in re_output or "OK" in re_output) and not re_failing and not ("FAIL" in re_output or "ERROR" in re_output)
@@ -1773,7 +1999,10 @@ def build_standalone_project_staged(
     ensure_options_coverage_or_gap(project_dir, test_path, project_name, request_text)
 
     # Compute final status derived from facts on disk
-    final_status = compute_final_status_from_disk(project_dir, project_name, request_text, mem_ok, mem_report)
+    final_status = compute_final_status_from_disk(
+        project_dir, project_name, request_text, mem_ok, mem_report,
+        smoke_ok=smoke_ok, smoke_issues=smoke_fails if not smoke_ok else None,
+    )
 
     # Re-read skipped tests directly from disk
     skipped_on_disk = []

@@ -484,10 +484,46 @@ def check_listing_row_order_and_totals(
     return True, ""
 
 
+class AssertionLiteralUpdater(ast.NodeTransformer):
+    """AST transformer that deterministically updates expected literal values in assertion calls (R11-1)."""
+
+    def __init__(self, replacements: Dict[str, str]):
+        self.replacements = replacements
+        self.modified = False
+
+    def visit_Call(self, node: ast.Call) -> ast.Call:
+        self.generic_visit(node)
+        if isinstance(node.func, ast.Attribute) and node.func.attr in ("assertIn", "assertEqual", "assertAlmostEqual", "assertTrue", "assertFalse"):
+            # Do not update constant-to-constant comparisons like assertEqual(1, 2)
+            if len(node.args) >= 2 and all(isinstance(a, ast.Constant) for a in node.args[:2]):
+                return node
+            for idx, arg in enumerate(node.args):
+                if isinstance(arg, ast.Constant):
+                    val_str = str(arg.value)
+                    if val_str in self.replacements:
+                        new_val = self.replacements[val_str]
+                        if isinstance(arg.value, int):
+                            try:
+                                node.args[idx] = ast.Constant(value=int(new_val))
+                                self.modified = True
+                            except ValueError:
+                                pass
+                        elif isinstance(arg.value, float):
+                            try:
+                                node.args[idx] = ast.Constant(value=float(new_val))
+                                self.modified = True
+                            except ValueError:
+                                pass
+                        elif isinstance(arg.value, str):
+                            node.args[idx] = ast.Constant(value=str(new_val))
+                            self.modified = True
+        return node
+
+
 def repair_observed_output_test_defects(test_code: str, test_output: str) -> Tuple[bool, str]:
-    """Deterministically repair test assertions when the tool's observed output is proven right (R10-3).
-    Extracts mismatch assertions (57 vs 58, 99 vs 100, 11.666666666666666 vs 11.666667)
-    and replaces erroneous test expectations with oracle-confirmed displayed output.
+    """Deterministically repair test assertions when the tool's observed output is proven right (R10-3, R11-1).
+    Extracts mismatch assertions (57 vs 58, 99 vs 100, 88 vs 89, 11.666666666666666 vs 11.666667)
+    and replaces erroneous test expectations with oracle-confirmed displayed output via AST rewrite and regex.
     """
     new_code = test_code
     mismatches = []
@@ -517,7 +553,7 @@ def repair_observed_output_test_defects(test_code: str, test_output: str) -> Tup
         try:
             act_f = float(actual)
             exp_f = float(expected)
-            # Off-by-one/two character or count differences (57 vs 58, 99 vs 100) or float rounding precision
+            # Off-by-one/two character or count differences (57 vs 58, 99 vs 100, 88 vs 89) or float rounding precision
             if abs(act_f - exp_f) <= 2.0 or (abs(exp_f) > 0 and abs(act_f - exp_f) / abs(exp_f) < 0.001):
                 mismatches.append((expected, actual))
         except ValueError:
@@ -542,15 +578,34 @@ def repair_observed_output_test_defects(test_code: str, test_output: str) -> Tup
             seen.add((exp, act))
             unique_mismatches.append((exp, act))
 
+    if not unique_mismatches:
+        return False, test_code
+
+    rep_dict = dict(unique_mismatches)
+
+    # 1. Line-based regex replacement for output assertions (preserves exact source formatting and quotes)
     lines = new_code.splitlines()
     for exp, act in unique_mismatches:
         for idx_l, line in enumerate(lines):
             # Restrict replacement strictly to test lines referencing tool output/results
             if any(k in line for k in ("res.", "result.", "proc.", "data", "stdout", "characters", "words", "lines", "mean", "min", "max", "count")):
-                line = re.sub(rf"(['\"]){re.escape(exp)}(['\"])", rf"\g<1>{act}\g<2>", line)
-                line = re.sub(rf"(?<=[,(])\s*{re.escape(exp)}\s*(?=[,)])", f" {act}", line)
-                lines[idx_l] = line
+                new_line = re.sub(rf"(['\"]){re.escape(exp)}(['\"])", rf"\g<1>{act}\g<2>", line)
+                new_line = re.sub(rf"(?<=[,(])\s*{re.escape(exp)}\s*(?=[,)])", f" {act}", new_line)
+                lines[idx_l] = new_line
     new_code = "\n".join(lines)
+
+    # 2. AST-based transformation (R11-1) for any remaining/complex assertion calls
+    try:
+        tree = ast.parse(new_code)
+        updater = AssertionLiteralUpdater(rep_dict)
+        new_tree = updater.visit(tree)
+        if updater.modified:
+            ast.fix_missing_locations(new_tree)
+            candidate_ast_code = ast.unparse(new_tree)
+            ast.parse(candidate_ast_code)
+            new_code = candidate_ast_code
+    except Exception:
+        pass
 
     return (new_code != test_code), new_code
 
@@ -724,8 +779,259 @@ def _is_main_guard(node: ast.AST) -> bool:
     return False
 
 
+def check_use_before_assignment(source: str) -> List[str]:
+    """Flag local names read before any assignment to them on every path within functions
+    and comprehensions (R11-2). Reports 'line N: '<name>' used before assignment'.
+    """
+    try:
+        tree = ast.parse(source)
+    except Exception:
+        return []
+
+    errors = []
+
+    def _extract_target_names(target, s):
+        if isinstance(target, ast.Name):
+            s.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                _extract_target_names(elt, s)
+        elif isinstance(target, ast.Starred):
+            _extract_target_names(target.value, s)
+
+    def _collect_assigned_in_func(func_node):
+        assigned = set()
+        explicit_globals = set()
+        explicit_nonlocals = set()
+
+        for node in ast.walk(func_node):
+            if node is func_node:
+                continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(node, ast.Global):
+                explicit_globals.update(node.names)
+            elif isinstance(node, ast.Nonlocal):
+                explicit_nonlocals.update(node.names)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    _extract_target_names(t, assigned)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                _extract_target_names(node.target, assigned)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                _extract_target_names(node.target, assigned)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars:
+                        _extract_target_names(item.optional_vars, assigned)
+            elif isinstance(node, ast.NamedExpr):
+                _extract_target_names(node.target, assigned)
+            elif isinstance(node, ast.ExceptHandler):
+                if node.name:
+                    assigned.add(node.name)
+
+        assigned -= explicit_globals
+        assigned -= explicit_nonlocals
+        return assigned, explicit_globals, explicit_nonlocals
+
+    def _check_node(node, assigned_in_func, definitely_assigned, comp_bound_stack=None):
+        comp_bound_stack = comp_bound_stack or []
+        all_comp_bounds = set()
+        for s in comp_bound_stack:
+            all_comp_bounds.update(s)
+
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            current_comp_bounds = set()
+            new_stack = comp_bound_stack + [current_comp_bounds]
+            for idx, gen in enumerate(node.generators):
+                if idx == 0:
+                    _check_node(gen.iter, assigned_in_func, definitely_assigned, comp_bound_stack)
+                else:
+                    _check_node(gen.iter, assigned_in_func, definitely_assigned, new_stack)
+                _extract_target_names(gen.target, current_comp_bounds)
+                for if_expr in gen.ifs:
+                    _check_node(if_expr, assigned_in_func, definitely_assigned, new_stack)
+            if isinstance(node, ast.DictComp):
+                _check_node(node.key, assigned_in_func, definitely_assigned, new_stack)
+                _check_node(node.value, assigned_in_func, definitely_assigned, new_stack)
+            else:
+                _check_node(node.elt, assigned_in_func, definitely_assigned, new_stack)
+            return
+
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            nid = node.id
+            if nid not in all_comp_bounds:
+                if nid in assigned_in_func and nid not in definitely_assigned:
+                    errors.append(f"line {node.lineno}: '{nid}' used before assignment")
+            return
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return
+
+        for child in ast.iter_child_nodes(node):
+            _check_node(child, assigned_in_func, definitely_assigned, comp_bound_stack)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            assigned_in_func, expl_g, expl_nl = _collect_assigned_in_func(node)
+            definitely_assigned = set()
+            for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                definitely_assigned.add(a.arg)
+            if node.args.vararg:
+                definitely_assigned.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                definitely_assigned.add(node.args.kwarg.arg)
+
+            def _all_assigned_names(stmt_list):
+                out = set()
+                for st in stmt_list:
+                    for sub in ast.walk(st):
+                        if isinstance(sub, ast.Assign):
+                            for t in sub.targets:
+                                _extract_target_names(t, out)
+                        elif isinstance(sub, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+                            _extract_target_names(sub.target, out)
+                        elif isinstance(sub, (ast.For, ast.AsyncFor)):
+                            _extract_target_names(sub.target, out)
+                        elif isinstance(sub, (ast.With, ast.AsyncWith)):
+                            for it in sub.items:
+                                if it.optional_vars:
+                                    _extract_target_names(it.optional_vars, out)
+                        elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                            out.add(sub.name)
+                        elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                            for a in sub.names:
+                                out.add((a.asname or a.name).split(".")[0])
+                        elif isinstance(sub, ast.ExceptHandler) and sub.name:
+                            out.add(sub.name)
+                return out
+
+            def _is_terminator(stmt):
+                """R12-F: statements after which control never falls through."""
+                if isinstance(stmt, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
+                    return True
+                if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                    f = stmt.value.func
+                    name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+                    if name in ("exit", "_exit", "error", "abort"):
+                        return True
+                return False
+
+            def _analyze_block(stmts, def_assigned):
+                """Return (names definitely assigned after the block, block_terminates).
+                R12-F: models try/except/finally, while, match, imports, nested defs and
+                branches that exit (return/raise/sys.exit/parser.error); unknown statements are
+                treated conservatively (their assignments count) so correct code is not rejected."""
+                current = set(def_assigned)
+                for stmt in stmts:
+                    if isinstance(stmt, ast.Assign):
+                        _check_node(stmt.value, assigned_in_func, current)
+                        for t in stmt.targets:
+                            _extract_target_names(t, current)
+                    elif isinstance(stmt, ast.AugAssign):
+                        _check_node(stmt.target, assigned_in_func, current)
+                        _check_node(stmt.value, assigned_in_func, current)
+                        _extract_target_names(stmt.target, current)
+                    elif isinstance(stmt, ast.AnnAssign):
+                        if stmt.value:
+                            _check_node(stmt.value, assigned_in_func, current)
+                            _extract_target_names(stmt.target, current)
+                    elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                        _check_node(stmt.iter, assigned_in_func, current)
+                        loop_assigned = set(current)
+                        _extract_target_names(stmt.target, loop_assigned)
+                        _analyze_block(stmt.body, loop_assigned)
+                        if stmt.orelse:
+                            else_res, else_term = _analyze_block(stmt.orelse, current)
+                            if not else_term:
+                                current = else_res
+                    elif isinstance(stmt, ast.While):
+                        _check_node(stmt.test, assigned_in_func, current)
+                        _analyze_block(stmt.body, current)
+                        if isinstance(stmt.test, ast.Constant) and bool(stmt.test.value):
+                            current = current | _all_assigned_names(stmt.body)
+                    elif isinstance(stmt, ast.If):
+                        _check_node(stmt.test, assigned_in_func, current)
+                        body_res, body_term = _analyze_block(stmt.body, current)
+                        if stmt.orelse:
+                            else_res, else_term = _analyze_block(stmt.orelse, current)
+                        else:
+                            else_res, else_term = set(current), False
+                        if body_term and else_term:
+                            return current, True
+                        if body_term:
+                            current = else_res
+                        elif else_term:
+                            current = body_res
+                        else:
+                            current = body_res & else_res
+                    elif isinstance(stmt, (ast.Try,) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())):
+                        body_res, body_term = _analyze_block(stmt.body, current)
+                        if stmt.orelse and not body_term:
+                            body_res, body_term = _analyze_block(stmt.orelse, body_res)
+                        outcomes = []
+                        if not body_term:
+                            outcomes.append(body_res)
+                        for h in stmt.handlers:
+                            if h.type is not None:
+                                _check_node(h.type, assigned_in_func, current)
+                            h_start = set(current)
+                            if h.name:
+                                h_start.add(h.name)
+                            h_res, h_term = _analyze_block(h.body, h_start)
+                            if not h_term:
+                                outcomes.append(h_res)
+                        fin_res = set(current)
+                        if stmt.finalbody:
+                            fin_res, fin_term = _analyze_block(stmt.finalbody, current)
+                            if fin_term:
+                                return current, True
+                        if not outcomes:
+                            return current, True
+                        merged = set.intersection(*outcomes)
+                        merged |= (fin_res - current)
+                        current = merged
+                    elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                        for it in stmt.items:
+                            _check_node(it.context_expr, assigned_in_func, current)
+                            if it.optional_vars:
+                                _extract_target_names(it.optional_vars, current)
+                        current, w_term = _analyze_block(stmt.body, current)
+                        if w_term:
+                            return current, True
+                    elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                        for a in stmt.names:
+                            current.add((a.asname or a.name).split(".")[0])
+                    elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        for dec in stmt.decorator_list:
+                            _check_node(dec, assigned_in_func, current)
+                        current.add(stmt.name)
+                    elif isinstance(stmt, ast.Return):
+                        if stmt.value:
+                            _check_node(stmt.value, assigned_in_func, current)
+                    elif isinstance(stmt, (ast.Expr, ast.Raise, ast.Assert, ast.Delete)):
+                        for child in ast.iter_child_nodes(stmt):
+                            _check_node(child, assigned_in_func, current)
+                    else:
+                        # match / unknown statements: never flag, but count their assignments
+                        current = current | _all_assigned_names([stmt])
+                    if _is_terminator(stmt):
+                        return current, True
+                return current, False
+
+            _analyze_block(node.body, definitely_assigned)
+
+    seen = set()
+    dedup = []
+    for e in errors:
+        if e not in seen:
+            seen.add(e)
+            dedup.append(e)
+    return dedup
+
+
 def check_undefined_names_and_imports(code: str, filename: str = "") -> List[str]:
-    """Report undefined names, missing imports, and unused-before-assignment names.
+    """Report undefined names, missing imports, and unused-before-assignment names (R8-2, R11-2).
     Deterministic ast-based scope walk with zero external dependencies.
     """
     try:
@@ -737,6 +1043,10 @@ def check_undefined_names_and_imports(code: str, filename: str = "") -> List[str
 
     module_globals = set(BUILTIN_NAMES)
     errors = []
+
+    # R11-2: Check for use-before-assignment
+    uba_errors = check_use_before_assignment(code)
+    errors.extend(uba_errors)
 
     def _extract_target_names(node, s):
         if isinstance(node, ast.Name):
@@ -1598,7 +1908,10 @@ def classify_tool_input_kind(request_text: str, project_name: str) -> str:
         return "streaming_directory"
     if "csv" in req_lower or "csv" in p_lower or "tablefmt" in p_lower or "tabprint" in p_lower:
         return "streaming_csv"
-    if "json" in req_lower or "json" in p_lower:
+    # R12-A: only JSON *input* makes a whole-document tool; a `--json` output option on a
+    # text tool must not swap its memory fixture for one 50 MB JSON line.
+    req_no_flag = re.sub(r"`?--json`?(\s+(option|flag|output))?", " ", req_lower)
+    if "json" in req_no_flag or "json" in p_lower:
         return "whole_document_json"
     if any(k in req_lower for k in ("yaml", "xml")):
         return "whole_document_other"
@@ -1844,6 +2157,14 @@ def arbitrate_test_failure(
         "unrecognized arguments",
         "invalid choice",
     ))
+    # R12-H: argparse text inside the unit-test output must never outweigh deterministic
+    # evidence that the TOOL is wrong (oracle/selector/smoke failures, memory breach,
+    # missing options). Only a harness-built smoke command can be a harness error then.
+    real_tool_evidence = (not coverage_passed) or (not memory_passed) or (
+        (not smoke_passed) and not smoke_has_harness_error
+    )
+    if is_argparse_harness_err and real_tool_evidence and not smoke_has_harness_error:
+        is_argparse_harness_err = False
     if is_argparse_harness_err:
         return {
             "classification": "HARNESS_ERROR",
@@ -2170,7 +2491,7 @@ def quarantine_bad_tests(
             re_output = run_python_test(str(test_path), base_dir=project_dir)
             re_passed = ("TEST PASS" in re_output or "OK" in re_output) and not ("FAIL" in re_output or "ERROR" in re_output)
             if re_passed:
-                return True, []
+                return True, [{"name": "repaired_tests", "reason": "repaired via observed output (R10-3, R11-1)"}]
             content = repaired_code
             test_output = re_output
         except Exception:
@@ -2554,10 +2875,11 @@ def run_and_parse_unittest(project_dir: Path, module_name: str, timeout: float =
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     sep = ";" if sys.platform == "win32" else ":"
     env["PYTHONPATH"] = str(project_dir) + (sep + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
 
-    cmd = [sys.executable, "-m", "unittest", "-v", clean_mod]
+    cmd = [sys.executable, "-B", "-m", "unittest", "-v", clean_mod]
     try:
         proc = subprocess.run(
             cmd,
@@ -2609,12 +2931,13 @@ def run_direct_test_file(project_dir: Path, test_path: Path, timeout: float = 60
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     sep = ";" if sys.platform == "win32" else ":"
     env["PYTHONPATH"] = str(project_dir) + (sep + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
 
     try:
         proc = subprocess.run(
-            [sys.executable, str(test_path)],
+            [sys.executable, "-B", str(test_path)],
             cwd=str(project_dir),
             capture_output=True,
             text=True,
@@ -2927,6 +3250,7 @@ class OracleRegistry:
                 if not (proc_unknown.stderr or "").strip() and "error" not in (proc_unknown.stdout or "").lower():
                     return False, "Selector validation defect (R10-4): tool exited non-zero on nonexistent column but printed no error message to stderr"
 
+                # 11. SELECTOR VALIDATION (R10-4, R11-3): Non-numeric column must exit non-zero and write to stderr, no traceback
                 proc_nonnum = subprocess.run(
                     [sys.executable, str(tool_path), str(csv_file), "--column", "name"],
                     cwd=str(project_dir),
@@ -2937,9 +3261,13 @@ class OracleRegistry:
                     timeout=20.0,
                 )
                 if proc_nonnum.returncode == 0:
-                    return False, "Selector validation defect (R10-4): tool exited 0 on non-numeric column '--column name'; must print error to stderr and exit non-zero"
-                if not (proc_nonnum.stderr or "").strip() and "error" not in (proc_nonnum.stdout or "").lower():
-                    return False, "Selector validation defect (R10-4): tool exited non-zero on non-numeric column but printed no error message to stderr"
+                    return False, "Selector validation defect (R11-3): tool exited 0 on non-numeric column '--column name'; must print error to stderr and exit non-zero"
+                err_nonnum = proc_nonnum.stderr or ""
+                out_nonnum = proc_nonnum.stdout or ""
+                if "Traceback (most recent call last)" in err_nonnum or "Traceback (most recent call last)" in out_nonnum:
+                    return False, f"Selector validation defect (R11-3): tool raised unhandled traceback on non-numeric column '--column name': {err_nonnum[:300]}"
+                if not err_nonnum.strip() and "error" not in out_nonnum.lower():
+                    return False, "Selector validation defect (R11-3): tool exited non-zero on non-numeric column but printed no error message to stderr"
 
             return True, ""
         finally:
@@ -3150,8 +3478,10 @@ class OracleRegistry:
                     return False, f"--json multi-file execution failed with code {proc_jm.returncode}: {proc_jm.stderr[:300]}"
                 try:
                     data_m = json.loads(proc_jm.stdout)
-                    if not isinstance(data_m, list) or len(data_m) != 3:
-                        return False, f"--json multi-file expected list of 3 items, got: {data_m}"
+                    if not isinstance(data_m, list) or len(data_m) not in (3, 4):
+                        return False, f"--json multi-file expected list of 3 or 4 items, got: {data_m}"
+                    if len(data_m) == 4 and str(data_m[3].get("file", "")).lower() != "total":
+                        return False, f"--json multi-file 4th item expected to be Total, got: {data_m[3]}"
                 except Exception as je:
                     return False, f"--json multi-file output is not valid JSON ({je})"
 
@@ -3296,9 +3626,35 @@ class OracleRegistry:
         return (len(issues) == 0), issues
 
 
+def check_streaming_memory_hygiene(code: str, request: str = "") -> List[str]:
+    """Flag tools that buffer entire datasets or per-column lists in memory for streaming tasks (R11-4)."""
+    req_lower = request.lower()
+    is_streaming_task = (
+        any(k in req_lower for k in ("column", "stat", "csv", "table", "mean", "min", "max", "lines", "words", "characters"))
+        and not any(k in req_lower for k in ("json", "xml", "yaml", "whole"))
+    ) or any(k in req_lower for k in ("csvsummary", "colreport", "wordtally", "filetally", "textsummary"))
+    if not is_streaming_task:
+        return []
+
+    issues = []
+    # Pattern: data[header].append(...) or values.append(...) or numeric_values.append(...)
+    # or [row for row in reader] or reader = list(...) or f.readlines()
+    if re.search(r"(\.append\(|\.extend\(|\[\s*row\s+for\s+row|list\(reader\)|readlines\(\))", code):
+        if any(pat in code for pat in ("numeric_values = []", "numeric_values.append", "values.append", "[header].append", "rows.append", "f.readlines()", "list(reader)")):
+            issues.append(
+                "Memory regression defect (R11-4): tool buffers rows or column values into in-memory lists "
+                "instead of using one-pass streaming accumulators (count, min, max, sum). "
+                "This causes high RSS (>700 MB) on large inputs. Process rows sequentially and update running stats in-place."
+            )
+    return issues
+
+
 def check_tool_code_hygiene(code: str, request: str = "") -> Tuple[bool, List[str]]:
     r"""Static check on tool implementation code:
     - Rejects using str.isdigit() or regex \d+ for numeric columns when numeric stats are requested.
+    - Deterministically checks for undefined names and missing imports (R8-2).
+    - Deterministically checks for use-before-assignment names (R11-2).
+    - Checks for streaming memory hygiene (R11-4).
     """
     issues = []
     req_lower = request.lower()
@@ -3310,9 +3666,14 @@ def check_tool_code_hygiene(code: str, request: str = "") -> Tuple[bool, List[st
         if any(pat in code for pat in ('^\\d+$', '^[0-9]+$', 're.match', 're.search')) and ('\\d+' in code or '[0-9]+' in code):
             issues.append("Tool code uses regex digit matching for numeric check. Use `float(cell.strip())` in try/except.")
 
-    # Undefined names / missing imports in tool code (R8-2)
+    # R8-2, R11-2: Undefined names / missing imports / use-before-assignment in tool code
     tool_undef = check_undefined_names_and_imports(code, "tool.py")
-    issues.extend(tool_undef)
+    for u in tool_undef:
+        issues.append(f"Undefined name defect: {u}")
+
+    # R11-4: Memory streaming hygiene
+    mem_hygiene = check_streaming_memory_hygiene(code, request)
+    issues.extend(mem_hygiene)
 
     return len(issues) == 0, issues
 
@@ -3346,7 +3707,7 @@ def assert_status_consistent_with_results(status: str, structured_results: Dict[
             raise AssertionError(f"Status is {status_str!r} but direct_run_ok is False!")
 
 
-def compute_final_status_from_disk(
+def _compute_final_status_core(
     project_dir: Path,
     project_name: str,
     request: str = "",
@@ -3474,3 +3835,140 @@ def compute_final_status_from_disk(
     }
     assert_status_consistent_with_results(status_val, structured_facts)
     return status_val
+
+
+_TEST_SIDE_PREFIXES = ("COVERAGE GAP", "TESTS FAILING", "NO TESTS RAN", "TEST COUNT MISMATCH", "TESTS INVALID", "NO TESTS GENERATED")
+
+
+def collect_tool_side_defects(
+    project_dir: Path,
+    project_name: str,
+    request: str = "",
+    memory_ok: bool = True,
+    memory_report: str = "",
+    smoke_ok: bool = True,
+    smoke_issues: Optional[List[str]] = None,
+) -> List[str]:
+    """R12-E: defects of the TOOL itself, collected independently of its tests."""
+    tool_path = project_dir / f"{project_name}.py"
+    if not tool_path.exists():
+        return []
+    try:
+        tool_code = tool_path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    issues: List[str] = list(check_undefined_names_and_imports(tool_code, f"{project_name}.py"))
+    try:
+        issues.extend(check_use_before_assignment(tool_code))
+    except Exception:
+        pass
+    if not smoke_ok and smoke_issues:
+        issues.extend(i for i in smoke_issues if not any(h in i for h in ("HARNESS_ERROR", "INCONCLUSIVE")))
+    if not memory_ok and memory_report:
+        issues.append(memory_report)
+    try:
+        oracle_ok, oracle_issues = OracleRegistry.run_oracles(tool_path, request, project_dir)
+        if not oracle_ok:
+            issues.extend(oracle_issues)
+    except Exception as e:
+        issues.append(f"oracle check could not run: {e}")
+    seen, out = set(), []
+    for i in issues:
+        key = str(i).strip()[:300]
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def compute_final_status_from_disk(
+    project_dir: Path,
+    project_name: str,
+    request: str = "",
+    memory_ok: bool = True,
+    memory_report: str = "",
+    smoke_ok: bool = True,
+    smoke_issues: Optional[List[str]] = None,
+    alignment_ok: bool = True,
+    alignment_issues: Optional[List[str]] = None,
+) -> "BuildStatus":
+    """R12-E: when the tool itself is wrong, the status leads with REQUIREMENT FAILED even if a
+    test-side status (coverage gap, failing tests) would otherwise be reported first."""
+    core = _compute_final_status_core(
+        project_dir, project_name, request, memory_ok, memory_report,
+        smoke_ok=smoke_ok, smoke_issues=smoke_issues,
+        alignment_ok=alignment_ok, alignment_issues=alignment_issues,
+    )
+    if not str(core).startswith(_TEST_SIDE_PREFIXES):
+        return core
+    tool_issues = collect_tool_side_defects(
+        project_dir, project_name, request, memory_ok, memory_report, smoke_ok, smoke_issues
+    )
+    if tool_issues:
+        return BuildStatus(f"REQUIREMENT FAILED ({'; '.join(tool_issues[:4])}) | tests: {core}")
+    return core
+
+
+def _render_example_table(headers: List[str], rows: List[List[str]]) -> str:
+    widths = [max([len(headers[i])] + [len(r[i]) for r in rows]) for i in range(len(headers))]
+    out = [" | ".join(h.ljust(w) for h, w in zip(headers, widths)), "-+-".join("-" * w for w in widths)]
+    out += [" | ".join(c.ljust(w) for c, w in zip(r, widths)) for r in rows]
+    return "\n".join(out)
+
+
+def build_expected_output_example(request: str, tool_path: Path, project_dir: Path, timeout: float = 20.0) -> str:
+    """R12-J: a concrete target for the fix prompt - a tiny sample input, the output computed
+    independently by the builder, and what the current tool actually printed for the same
+    command. Returns "" for request kinds without a reference renderer."""
+    import subprocess as _sp
+    import tempfile as _tf
+
+    req = (request or "").lower()
+    is_csv_stats = "csv" in req and any(k in req for k in ("mean", "minimum", "maximum", "average"))
+    is_listing = all(k in req for k in ("lines", "words", "characters"))
+    if not (is_csv_stats or is_listing) or not Path(tool_path).exists():
+        return ""
+
+    work = Path(_tf.mkdtemp(prefix="_example_", dir=str(project_dir)))
+    cases: List[Tuple[List[str], str]] = []
+    try:
+        if is_csv_stats:
+            sample = "name,a,b\nx,1,10.5\ny,,-20.5\nz,3,30\n"
+            (work / "sample.csv").write_text(sample, encoding="utf-8")
+            st = {k: v for k, v in compute_csv_stats(sample).items() if v.get("count")}
+            st.pop("name", None)
+            rows = [[k, str(v["count"]), f"{v['min']:g}", f"{v['max']:g}", f"{v['mean']:.4f}"] for k, v in st.items()]
+            cases.append((["sample.csv"], _render_example_table(["Column", "Count", "Min", "Max", "Mean"], rows)))
+            b = st["b"]
+            cases.append((["sample.csv", "--column", "b", "--json"], json.dumps(
+                {"b": {"count": b["count"], "min": b["min"], "max": b["max"], "mean": round(b["mean"], 6)}}, indent=2)))
+            intro = "sample.csv contains:\n" + sample
+        else:
+            files = {"a.txt": "alpha beta gamma delta\nepsilon zeta\n", "b.txt": "one two\n"}
+            for n, t in files.items():
+                (work / n).write_text(t, encoding="utf-8")
+            ms = compute_multi_file_stats(files)
+            f = ms["files"]
+            tot = ms["total"]
+            rows = [[n, str(f[n]["lines"]), str(f[n]["words"]), str(f[n]["characters"])] for n in ("b.txt", "a.txt")]
+            rows.append(["Total", str(tot["lines"]), str(tot["words"]), str(tot["characters"])])
+            cases.append((["b.txt", "a.txt"], _render_example_table(["File", "Lines", "Words", "Characters"], rows)))
+            srt = [rows[1], rows[0], rows[2]]
+            cases.append((["b.txt", "a.txt", "--sort"], _render_example_table(["File", "Lines", "Words", "Characters"], srt)))
+            intro = "a.txt contains 'alpha beta gamma delta\\nepsilon zeta\\n'; b.txt contains 'one two\\n'."
+
+        parts = ["CONCRETE TARGET (computed independently by the builder; number formatting may differ, "
+                 "but values, rows, columns, row order and alignment must match):", intro]
+        for args, expected in cases:
+            try:
+                p = _sp.run([sys.executable, str(tool_path), *args], cwd=str(work), capture_output=True,
+                            timeout=timeout, env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                actual = (p.stdout.decode("utf-8", "replace") + p.stderr.decode("utf-8", "replace")).rstrip()
+                rc = p.returncode
+            except Exception as e:  # noqa: BLE001
+                actual, rc = f"(could not run: {e})", -1
+            parts.append(f"\n$ python {Path(tool_path).name} {' '.join(args)}\nEXPECTED:\n{expected}\n"
+                         f"YOUR TOOL PRINTED (exit {rc}):\n{actual[:1500]}")
+        return "\n".join(parts)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)

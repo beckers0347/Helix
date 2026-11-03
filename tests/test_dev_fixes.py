@@ -2989,6 +2989,601 @@ b      | 3     | -20.5 | 30.0 | 6.666667
     assert ok_v, f"Valid evidence-backed report must pass, got: {iss_v}"
 
 
+def test_r11_observed_output_test_repair():
+    """R11-1: Scripted fake reproducing exact wordtally assertions (99 vs 100, 88 vs 89, JSON 100 != 99).
+    Must end with all assertions repaired and tests passing without regenerating the tool.
+    """
+    from helix_core.quality import repair_observed_output_test_defects
+    from helix_core.standalone_builder import write_scaffold_file
+    from helix_core.codetools import run_python_test
+
+    test_code = """from _scaffold import ToolTestCase
+import unittest
+
+class TestWordtally(ToolTestCase):
+    def test_multiple_files(self):
+        self.text_file("f1.txt", "line one alpha\\n")
+        res = self.run_tool("f1.txt")
+        self.assertOk(res)
+        self.assertIn("99", res.stdout)
+
+    def test_multiple_files_json(self):
+        res = self.run_tool("f1.txt", "--json")
+        self.assertOk(res)
+        data = self.assertJsonOutput(res)
+        self.assertEqual(data[0]["characters"], 99)
+
+    def test_min_words(self):
+        res = self.run_tool("f1.txt", "--min-words", "4")
+        self.assertOk(res)
+        self.assertIn("88", res.stdout)
+
+    def test_min_words_json(self):
+        res = self.run_tool("f1.txt", "--min-words", "4", "--json")
+        self.assertOk(res)
+        data = self.assertJsonOutput(res)
+        self.assertEqual(data[0]["characters"], 88)
+
+if __name__ == "__main__":
+    unittest.main()
+"""
+
+    simulated_failure_output = """FAIL: test_multiple_files
+AssertionError: '99' not found in 'File   | Lines | Words | Characters\\nTotal  | 4     | 19    | 100       '
+
+FAIL: test_multiple_files_json
+AssertionError: 100 != 99
+
+FAIL: test_min_words
+AssertionError: '88' not found in 'File   | Lines | Words | Characters\\nTotal  | 3     | 17    | 89        '
+
+FAIL: test_min_words_json
+AssertionError: 89 != 88
+"""
+
+    repaired, repaired_code = repair_observed_output_test_defects(test_code, simulated_failure_output)
+    assert repaired, "R11-1 repair must detect mismatches and report repaired=True"
+    assert 'assertIn("100", res.stdout)' in repaired_code, "99 in assertIn must be rewritten to 100"
+    assert 'assertEqual(data[0]["characters"], 100)' in repaired_code, "99 in assertEqual must be rewritten to 100"
+    assert 'assertIn("89", res.stdout)' in repaired_code, "88 in assertIn must be rewritten to 89"
+    assert 'assertEqual(data[0]["characters"], 89)' in repaired_code, "88 in assertEqual must be rewritten to 89"
+
+    # End-to-end execution of fake project with repaired tests
+    with tempfile.TemporaryDirectory() as td:
+        t_dir = Path(td)
+        write_scaffold_file(t_dir, "wordtally")
+
+        # Fake wordtally that outputs 100 / 89
+        fake_tool = t_dir / "wordtally.py"
+        fake_tool.write_text("""import sys, json
+if "--json" in sys.argv:
+    if "--min-words" in sys.argv:
+        print(json.dumps([{"file": "Total", "lines": 3, "words": 17, "characters": 89}]))
+    else:
+        print(json.dumps([{"file": "Total", "lines": 4, "words": 19, "characters": 100}]))
+else:
+    if "--min-words" in sys.argv:
+        print("File   | Lines | Words | Characters\\nTotal  | 3     | 17    | 89        ")
+    else:
+        print("File   | Lines | Words | Characters\\nTotal  | 4     | 19    | 100       ")
+""", encoding="utf-8")
+
+        test_file = t_dir / "test_wordtally.py"
+        test_file.write_text(test_code, encoding="utf-8")
+
+        # Initial execution fails
+        init_out = run_python_test(str(test_file), base_dir=t_dir)
+        init_pass = ("TEST PASS" in init_out or "OK" in init_out) and not ("FAIL" in init_out or "ERROR" in init_out)
+        assert not init_pass, "Initial tests with arithmetic errors must fail"
+
+        # Apply repair
+        ok, rep_c = repair_observed_output_test_defects(test_code, init_out)
+        assert ok, "repair must fire from actual test output"
+        test_file.write_text(rep_c, encoding="utf-8")
+        pycache = t_dir / "__pycache__"
+        if pycache.exists():
+            shutil.rmtree(pycache, ignore_errors=True)
+
+        # Re-execution must end PASSED without regenerating tool
+        final_out = run_python_test(str(test_file), base_dir=t_dir)
+        final_pass = ("TEST PASS" in final_out or "OK" in final_out) and not ("FAIL" in final_out or "ERROR" in final_out)
+        assert final_pass, f"Repaired test suite must PASS completely, got:\n{final_out}"
+
+
+def test_r11_use_before_assignment_checker():
+    """R11-2: Use-before-assignment and unbound-local check.
+    Must cover all 5 required test cases:
+    1. Exact csvsummary print_table
+    2. Correct loop variable
+    3. Conditional assignment (if x: y = 1 then use -> flag)
+    4. Globals/builtins (no flag)
+    5. Nonlocal/global (no flag)
+    """
+    from helix_core.quality import check_use_before_assignment
+
+    # 1. Exact csvsummary print_table
+    exact_csvsummary_code = """
+def print_table(stats):
+    headers = ['Column', 'Count', 'Min', 'Max', 'Mean']
+    widths = [max(len(header), max(len(str(stat[h])) for stat in stats.values())) for h in headers]
+    header_line = ' | '.join(f'{h:<{w}}' for h, w in zip(headers, widths))
+    sep_line = '-+-'.join('-' * w for w in widths)
+    data_lines = []
+    for header, stat in stats.items():
+        data_line = ' | '.join(f'{str(stat[h]):<{w}}' for h, w in zip(headers[1:], [len(header)] + widths[1:]))
+        data_lines.append(f'{header:<{widths[0]}} | {data_line}')
+    print('\\n'.join([header_line, sep_line] + data_lines))
+"""
+    errs_1 = check_use_before_assignment(exact_csvsummary_code)
+    assert len(errs_1) >= 1, "Must catch 'header' used before assignment in csvsummary print_table"
+    assert any("'header' used before assignment" in e for e in errs_1), f"Expected 'header' used before assignment, got: {errs_1}"
+
+    # 2. Correct loop variable
+    correct_loop = """
+def sum_items(items):
+    total = 0
+    for x in items:
+        total += x
+    return total
+"""
+    errs_2 = check_use_before_assignment(correct_loop)
+    assert errs_2 == [], f"Correct loop variable must not be flagged, got: {errs_2}"
+
+    # 3. Conditional assignment (if x: y = 1 then use -> flag)
+    cond_assign = """
+def process(flag):
+    if flag:
+        val = 100
+    return val
+"""
+    errs_3 = check_use_before_assignment(cond_assign)
+    assert len(errs_3) >= 1, "Must flag conditional assignment used on path where not assigned"
+    assert any("'val' used before assignment" in e for e in errs_3), f"Expected 'val' used before assignment, got: {errs_3}"
+
+    # 4. Globals/builtins (no flag)
+    globals_builtins = """
+GLOBAL_LIMIT = 50
+def calculate(data):
+    return len(data) + max(data) + GLOBAL_LIMIT
+"""
+    errs_4 = check_use_before_assignment(globals_builtins)
+    assert errs_4 == [], f"Builtins and globals must not be flagged, got: {errs_4}"
+
+    # 5. Nonlocal/global (no flag)
+    nonlocal_global = """
+GLOBAL_COUNTER = 0
+def increment():
+    global GLOBAL_COUNTER
+    GLOBAL_COUNTER += 1
+    return GLOBAL_COUNTER
+
+def outer():
+    counter = 1
+    def inner():
+        nonlocal counter
+        counter += 1
+        return counter
+    return inner()
+"""
+    errs_5 = check_use_before_assignment(nonlocal_global)
+    assert errs_5 == [], f"nonlocal and global statements must not be flagged, got: {errs_5}"
+
+
+def test_r11_selector_non_numeric_validation():
+    """R11-3: Selector on a non-numeric column must exit non-zero, clear stderr, and NO traceback."""
+    from helix_core.quality import OracleRegistry
+
+    with tempfile.TemporaryDirectory() as td:
+        t_dir = Path(td)
+
+        # Defective tool that raises KeyError on non-numeric column (like csvsummary)
+        broken_tool = t_dir / "broken_col.py"
+        broken_tool.write_text("""import sys, csv, json
+
+def main():
+    csv_file = None
+    col = None
+    is_json = False
+    delim = ","
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--column":
+            col = args[i+1]; i += 2
+        elif args[i] == "--json":
+            is_json = True; i += 1
+        elif args[i] == "--delimiter":
+            delim = args[i+1]; i += 2
+        else:
+            csv_file = args[i]; i += 1
+
+    if not csv_file:
+        sys.stderr.write("Error: missing file\\n")
+        sys.exit(1)
+
+    with open(csv_file, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f, delimiter=delim)
+        try:
+            headers = next(reader)
+        except StopIteration:
+            sys.stderr.write("Error: empty csv\\n")
+            sys.exit(1)
+
+        counts = {h: 0 for h in headers}
+        sums = {h: 0.0 for h in headers}
+        mins = {h: None for h in headers}
+        maxs = {h: None for h in headers}
+
+        for row in reader:
+            for h, cell in zip(headers, row):
+                cell_s = cell.strip()
+                if not cell_s:
+                    continue
+                try:
+                    val = float(cell_s)
+                    counts[h] += 1
+                    sums[h] += val
+                    if mins[h] is None or val < mins[h]:
+                        mins[h] = val
+                    if maxs[h] is None or val > maxs[h]:
+                        maxs[h] = val
+                except ValueError:
+                    pass
+
+    numeric_cols = [h for h in headers if counts[h] > 0]
+    if col:
+        if col not in headers:
+            sys.stderr.write(f"Error: unknown column '{col}'\\n")
+            sys.exit(1)
+        # Bug: does not check if col in numeric_cols! Looking up in stats will raise KeyError on 'name'
+        show_cols = [col]
+    else:
+        show_cols = numeric_cols
+
+    stats = {h: {"count": counts[h], "min": mins[h], "max": maxs[h], "mean": sums[h]/counts[h]} for h in numeric_cols}
+
+    # If col is non-numeric, stats[col] raises KeyError!
+    selected = {h: stats[h] for h in show_cols}
+
+    if is_json:
+        print(json.dumps(selected))
+    else:
+        print("Column | Count | Min   | Max  | Mean    ")
+        print("-------+-------+-------+------+---------")
+        for h, s in selected.items():
+            print(f"{h:<6} | {s['count']:<5} | {s['min']:<5.1f} | {s['max']:<4.1f} | {s['mean']:<8.6f}")
+
+if __name__ == "__main__":
+    main()
+""", encoding="utf-8")
+
+        req = "Build me a tool with --column NAME, --delimiter, and --json option."
+        ok_broken, err_broken = OracleRegistry.oracle_csv_column_stats(broken_tool, req, t_dir)
+        assert not ok_broken, "Must flag tool that crashes with KeyError/traceback on non-numeric column"
+        assert "Selector validation defect (R11-3)" in err_broken or "traceback" in err_broken.lower(), f"Unexpected error: {err_broken}"
+
+        # Correct tool that prints stderr error and exits 1 with NO traceback
+        clean_tool = t_dir / "clean_col.py"
+        clean_tool.write_text("""import sys, csv, json
+
+def main():
+    csv_file = None
+    col = None
+    is_json = False
+    delim = ","
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--column":
+            col = args[i+1]; i += 2
+        elif args[i] == "--json":
+            is_json = True; i += 1
+        elif args[i] == "--delimiter":
+            delim = args[i+1]; i += 2
+        else:
+            csv_file = args[i]; i += 1
+
+    if not csv_file:
+        sys.stderr.write("Error: missing file\\n")
+        sys.exit(1)
+
+    with open(csv_file, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f, delimiter=delim)
+        try:
+            headers = next(reader)
+        except StopIteration:
+            sys.stderr.write("Error: empty csv\\n")
+            sys.exit(1)
+
+        counts = {h: 0 for h in headers}
+        sums = {h: 0.0 for h in headers}
+        mins = {h: None for h in headers}
+        maxs = {h: None for h in headers}
+
+        for row in reader:
+            for h, cell in zip(headers, row):
+                cell_s = cell.strip()
+                if not cell_s:
+                    continue
+                try:
+                    val = float(cell_s)
+                    counts[h] += 1
+                    sums[h] += val
+                    if mins[h] is None or val < mins[h]:
+                        mins[h] = val
+                    if maxs[h] is None or val > maxs[h]:
+                        maxs[h] = val
+                except ValueError:
+                    pass
+
+    numeric_cols = [h for h in headers if counts[h] > 0]
+    if col:
+        if col not in headers or col not in numeric_cols:
+            sys.stderr.write(f"Error: column '{col}' has no numeric values\\n")
+            sys.exit(1)
+        show_cols = [col]
+    else:
+        show_cols = numeric_cols
+
+    stats = {h: {"count": counts[h], "min": mins[h], "max": maxs[h], "mean": sums[h]/counts[h]} for h in show_cols}
+
+    if is_json:
+        print(json.dumps(stats))
+    else:
+        print("Column | Count | Min   | Max  | Mean    ")
+        print("-------+-------+-------+------+---------")
+        for h, s in stats.items():
+            print(f"{h:<6} | {s['count']:<5} | {s['min']:<5.1f} | {s['max']:<4.1f} | {s['mean']:<8.6f}")
+
+if __name__ == "__main__":
+    main()
+""", encoding="utf-8")
+
+        ok_clean, err_clean = OracleRegistry.oracle_csv_column_stats(clean_tool, req, t_dir)
+        assert ok_clean, f"Clean tool handling selector validation must PASS oracle, got: {err_clean}"
+
+
+def test_r11_memory_streaming_gate():
+    """R11-4: Memory streaming gate flags list-buffering implementations for streaming tasks."""
+    from helix_core.quality import check_streaming_memory_hygiene, check_tool_code_hygiene
+
+    # List-buffering implementation (like csvsummary)
+    list_buffering_code = """import csv, sys
+
+def read_csv(path):
+    headers = []
+    numeric_values = []
+    with open(path) as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+        for row in reader:
+            numeric_values.append(float(row[0]))
+    return headers, numeric_values
+"""
+    req = "Build tool to calculate mean, min, max, count for numeric columns from large CSV file."
+    hyg_ok, issues = check_tool_code_hygiene(list_buffering_code, req)
+    assert not hyg_ok, "Must flag list-buffering tool on streaming CSV task"
+    assert any("Memory regression defect (R11-4)" in i for i in issues), f"Expected memory regression defect, got: {issues}"
+
+    # Single-pass streaming accumulator implementation
+    streaming_code = """import csv, sys
+
+def stream_csv(path):
+    count = 0
+    total = 0.0
+    min_v = None
+    max_v = None
+    with open(path) as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            val = float(row[0].strip())
+            count += 1
+            total += val
+            if min_v is None or val < min_v: min_v = val
+            if max_v is None or val > max_v: max_v = val
+    return count, min_v, max_v, total/count
+"""
+    clean_ok, clean_issues = check_tool_code_hygiene(streaming_code, req)
+    mem_issues = [i for i in clean_issues if "Memory regression" in i]
+    assert len(mem_issues) == 0, f"Streaming accumulators must not be flagged for memory regression: {mem_issues}"
+
+
+
+# ---------------------------------------------------------------------------
+# Round 12 regressions (from the round-11 colreport evidence)
+# ---------------------------------------------------------------------------
+R12_FIX = Path(__file__).resolve().parent / "fixtures" / "round12"
+R12_COLREPORT_REQ = (
+    "Build me a command-line tool called `colreport`. Give it a CSV file with a header row and it prints, for "
+    "each numeric column, the count, minimum, maximum and mean, ignoring empty cells and non-numeric columns, as "
+    "an aligned plain-text table with a header separator line. It needs a `--json` option, a `--delimiter` option "
+    "(default comma) and a `--column NAME` option to show only that column. Write tests for it, run them, and "
+    "make sure they pass."
+)
+
+
+def test_r12_use_before_assignment_flow_cases() -> None:
+    from helix_core.quality import check_use_before_assignment as c
+    must_flag = [
+        "def p(stats, headers):\n    widths=[max(len(header), 1) for h in headers]\n    for header in headers:\n        pass\n",
+        "def f(x):\n    if x:\n        y=1\n    return y\n",
+        "def f():\n    try:\n        x=g()\n    except Exception:\n        pass\n    return x\n",
+    ]
+    ok_code = [
+        "import sys\ndef f(p):\n    try:\n        a,b = g(p)\n    except OSError:\n        sys.exit(1)\n    return a+b\n",
+        "def f():\n    a=b=c=0\n    return a+b+c\n",
+        "def f(x):\n    if x:\n        return 1\n    else:\n        y=2\n    return y\n",
+        "def f():\n    while True:\n        v=g()\n        if v: break\n    return v\n",
+        "def f():\n    import csv\n    return csv\n",
+        "def f():\n    try:\n        x=1\n    finally:\n        pass\n    return x\n",
+        "def f(a, parser):\n    if a: v=1\n    else: parser.error('x')\n    return v\n",
+    ]
+    for code in must_flag:
+        assert c(code), f"should flag:\n{code}"
+    for code in ok_code:
+        assert not c(code), f"false positive {c(code)} on:\n{code}"
+    good = (R12_FIX / "colreport_good.py").read_text(encoding="utf-8")
+    assert not c(good), c(good)
+
+
+def test_r12_status_leads_with_tool_defect() -> None:
+    import tempfile, shutil
+    from helix_core.quality import compute_final_status_from_disk
+    from helix_core.standalone_builder import write_scaffold_file
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "colreport.py").write_text((R12_FIX / "colreport_broken.py").read_text(encoding="utf-8"), encoding="utf-8")
+        (d / "test_colreport.py").write_text((R12_FIX / "test_colreport_good.py").read_text(encoding="utf-8"), encoding="utf-8")
+        write_scaffold_file(d, "colreport")
+        st = compute_final_status_from_disk(d, "colreport", R12_COLREPORT_REQ)
+        assert str(st).startswith("REQUIREMENT FAILED"), st
+        assert "max() iterable argument is empty" in st, st
+        assert "| tests:" in st, st
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_r12_scripted_build_recovers_from_broken_colreport() -> None:
+    import tempfile, shutil
+    from helix_core.standalone_builder import build_standalone_project_staged
+    broken = (R12_FIX / "colreport_broken.py").read_text(encoding="utf-8")
+    good = (R12_FIX / "colreport_good.py").read_text(encoding="utf-8")
+    tests = (R12_FIX / "test_colreport_good.py").read_text(encoding="utf-8")
+    client = MockChatClient(
+        [{"content": f"```python\n{broken}\n```"}, {"content": f"```python\n{tests}\n```"}]
+        + [{"content": f"```python\n# FILE: colreport.py\n{good}\n```"}] * 6
+    )
+    engine = CoreEngine(client=client)
+    test_dir = tempfile.mkdtemp()
+    try:
+        with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
+            success, msg, details = build_standalone_project_staged(engine, R12_COLREPORT_REQ, max_attempts=3)
+        prompts = [m[0]["content"] for m in client.call_history]
+        fix_prompts = [p for p in prompts if "FAILURES TO FIX" in p]
+        assert fix_prompts, "no fix prompt sent"
+        assert "SMOKE / ORACLE / LAYOUT FAILURES" in fix_prompts[0], fix_prompts[0][-2000:]
+        assert "max() iterable argument is empty" in fix_prompts[0]
+        assert "CURRENT TOOL CODE" in fix_prompts[0]
+        assert success is True, msg[-1500:]
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_r12_text_tool_with_json_flag_gets_text_memory_fixture() -> None:
+    import tempfile, shutil
+    import helix_core.quality as q
+    seen = {}
+    real_popen = q.subprocess.Popen
+
+    class SpyPopen(real_popen):
+        def __init__(self, cmd, *a, **k):
+            if isinstance(cmd, (list, tuple)) and len(cmd) > 2:
+                seen.setdefault("target", str(cmd[2]))
+            super().__init__(cmd, *a, **k)
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        tool = d / "filetally.py"
+        tool.write_text("import sys\nfor p in sys.argv[1:]:\n    n = sum(1 for _ in open(p, encoding='utf-8'))\nprint(n)\n", encoding="utf-8")
+        req = ("Build me a command-line tool called filetally. Give it one or more text files and it prints the "
+               "number of lines, words and characters. It needs a --json option and a --sort option.")
+        with patch.object(q.subprocess, "Popen", SpyPopen):
+            ok, peak, report = q.check_tool_memory_budget(d, tool, "filetally", req)
+        assert ok, report
+        assert not seen.get("target", "").endswith(".json"), f"text tool got a JSON memory fixture: {seen}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+
+def test_r12h_argparse_text_in_tests_does_not_hide_tool_defects() -> None:
+    """Round-11/12 colsheet: a test's argparse error made arbitration say HARNESS_ERROR although
+    smoke/oracle had found real tool defects, so the tool was never regenerated."""
+    from helix_core.quality import arbitrate_test_failure
+    test_output = ("AssertionError: 'Error' not found in 'usage: colsheet.py [-h]\\n"
+                   "colsheet.py: error: unrecognized arguments: --column x'")
+    res = arbitrate_test_failure(request="Build me a command-line tool called colsheet with --json and --column NAME",
+              tool_code="import argparse", test_code="", test_output=test_output,
+              failing_tests=["test_x"], smoke_passed=False, coverage_passed=True, memory_passed=False,
+              client=None, smoke_has_harness_error=False)
+    assert res["classification"] == "TOOL", res
+    res2 = arbitrate_test_failure(request="Build me a command-line tool called colsheet with --json", tool_code="import argparse",
+               test_code="", test_output=test_output, failing_tests=["test_x"], smoke_passed=True,
+               coverage_passed=True, memory_passed=True, client=None, smoke_has_harness_error=False)
+    assert res2["classification"] == "HARNESS_ERROR", res2
+
+
+
+def test_r12i_tool_prompt_contains_only_relevant_guidance() -> None:
+    """Round-12 colsheet/colbrief: the tool prompt carried the agent persona (tool calls, write_file),
+    JSON sentinel lookups, --max-width truncation and two-pass re-open streaming for a CSV-stats request."""
+    from helix_core.standalone_builder import build_tool_generation_prompt
+    from helix_core.quality import extract_requested_flags
+    p = build_tool_generation_prompt(R12_COLREPORT_REQ, "colreport", extract_requested_flags(R12_COLREPORT_REQ))
+    for banned in ("write_file", "tool calls", "_MISSING", "--max-width", "Re-open or seek", "dupefinder"):
+        assert banned not in p, f"irrelevant guidance in CSV prompt: {banned}"
+    for needed in ("non_numeric_seen", "ONE entry per column", "has no numeric values", "--delimiter", "--column", "--json"):
+        assert needed in p, f"missing guidance: {needed}"
+    lookup_req = "Build me a command-line tool called tomlget. Give it a TOML file and a dotted key path like a.b and it prints the value. It needs a --json option."
+    p2 = build_tool_generation_prompt(lookup_req, "tomlget", extract_requested_flags(lookup_req))
+    assert "_MISSING" in p2 and "non_numeric_seen" not in p2
+
+
+
+def test_r12j_concrete_target_example() -> None:
+    import tempfile, shutil
+    from helix_core.quality import build_expected_output_example
+    d = Path(tempfile.mkdtemp())
+    try:
+        ex = build_expected_output_example(R12_COLREPORT_REQ, R12_FIX / "colreport_broken.py", d)
+        assert "EXPECTED:" in ex and "YOUR TOOL PRINTED (exit 1)" in ex, ex
+        assert "b      | 3     | -20.5 | 30  | 6.6667" in ex, ex
+        assert "max() iterable argument is empty" in ex
+        assert not any(p.name.startswith("_example_") for p in d.iterdir())
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+
+def test_r12k_scaffold_splits_flag_value_argument() -> None:
+    import subprocess, tempfile, shutil
+    from helix_core.standalone_builder import write_scaffold_file
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "probe.py").write_text("import sys, json\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+        write_scaffold_file(d, "probe")
+        (d / "test_probe.py").write_text(
+            "import unittest, json\nfrom _scaffold import ToolTestCase\n"
+            "class T(ToolTestCase):\n"
+            "    def test_split(self):\n"
+            "        r = self.run_tool('f.csv', '--column zz', '--delimiter=;', 'plain name.txt')\n"
+            "        self.assertEqual(json.loads(r.stdout), ['f.csv', '--column', 'zz', '--delimiter=;', 'plain name.txt'])\n"
+            "if __name__ == '__main__':\n    unittest.main()\n", encoding="utf-8")
+        p = subprocess.run([sys.executable, "-m", "unittest", "test_probe"], cwd=str(d), capture_output=True, text=True)
+        assert "OK" in p.stderr, p.stderr
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+
+def test_r12m_correct_csv_tool_gets_clean_smoke() -> None:
+    """Round-12 colsight: the alignment smoke fixture was written with literal backslash-n, so a
+    correct tool got a false 'Table alignment error' and PASSED WITH ISSUES."""
+    import tempfile, shutil
+    from helix_core.standalone_builder import run_smoke_tests
+    d = Path(tempfile.mkdtemp())
+    try:
+        tool = d / "colreport.py"
+        tool.write_text((R12_FIX / "colreport_good.py").read_text(encoding="utf-8"), encoding="utf-8")
+        ok, report, fails, samples, harness = run_smoke_tests(d, tool, "colreport", R12_COLREPORT_REQ, return_samples=True)
+        assert ok, fails
+        assert "\\n" not in report, "smoke report contains literal backslash-n"
+        assert "Smoke test table alignment (standard layout): PASSED" in report, report
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def run_all_dev_fix_tests() -> bool:
     suites = [
         ("H1: Windows Unicode / cp1252 Smoke & Static Check", test_h1_windows_unicode_cp1252_smoke_and_static_check),
@@ -3041,6 +3636,15 @@ def run_all_dev_fix_tests() -> bool:
         ("R7: Zero Tests Ran & Count Mismatch Fails", test_r7_zero_tests_ran_fails),
         ("R7: Missing Main Guard Appends and Runs", test_r7_missing_main_guard_appends_and_runs),
         ("R7: Colstats Exact Reproduction Not Passed", test_r7_colstats_exact_reproduction_not_passed),
+        ("R12: Use-Before-Assignment Flow Cases", test_r12_use_before_assignment_flow_cases),
+        ("R12: Correct CSV Tool Gets Clean Smoke", test_r12m_correct_csv_tool_gets_clean_smoke),
+        ("R12: Scaffold Splits '--flag value' Argument", test_r12k_scaffold_splits_flag_value_argument),
+        ("R12: Concrete Target Example In Fix Prompt", test_r12j_concrete_target_example),
+        ("R12: Tool Prompt Contains Only Relevant Guidance", test_r12i_tool_prompt_contains_only_relevant_guidance),
+        ("R12: Argparse Text In Tests Does Not Hide Tool Defects", test_r12h_argparse_text_in_tests_does_not_hide_tool_defects),
+        ("R12: Status Leads With Tool Defect", test_r12_status_leads_with_tool_defect),
+        ("R12: Scripted Build Recovers From Broken colreport", test_r12_scripted_build_recovers_from_broken_colreport),
+        ("R12: Text Tool With --json Gets Text Memory Fixture", test_r12_text_tool_with_json_flag_gets_text_memory_fixture),
         ("R7: Status Reconciliation Consistency Assertion", test_r7_status_reconciliation_consistency_assertion),
         ("R7: Reference Oracle CSV Column Stats", test_r7_oracle_csv_column_stats),
         ("R7: Reference Oracle Dotted Path Lookup", test_r7_oracle_dotted_path_lookup),
@@ -3062,6 +3666,10 @@ def run_all_dev_fix_tests() -> bool:
         ("R10: Observed-Output Test Repair", test_r10_observed_output_test_repair),
         ("R10: Selector Validation", test_r10_selector_validation),
         ("R10: Report Consistency Verifier Evidence-Backed", test_r10_report_consistency_verifier_evidence_backed),
+        ("R11: Observed-Output Test Repair AST", test_r11_observed_output_test_repair),
+        ("R11: Use-Before-Assignment / Unbound-Local Checker", test_r11_use_before_assignment_checker),
+        ("R11: Selector on Non-Numeric Column", test_r11_selector_non_numeric_validation),
+        ("R11: Memory Regression Streaming Gate", test_r11_memory_streaming_gate),
     ]
 
     print("=" * 60)
