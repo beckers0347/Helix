@@ -1,5 +1,5 @@
 name: Bug report
-description: Helix crashed, gave an error, or did something wrong.
+description: Ogun crashed, gave an error, or did something wrong.
 labels: [bug]
 body:
   - type: textarea
@@ -14,7 +14,7 @@ body:
     attributes:
       label: Steps to reproduce
       placeholder: |
-        1. run_helix.bat
+        1. run_ogun.bat
         2. typed "..."
         3. ...
     validations:
@@ -29,7 +29,7 @@ body:
     id: hardware
     attributes:
       label: Your setup
-      description: Paste the output of `run_helix.bat --hardware-info`, plus your Windows version and Ollama model.
+      description: Paste the output of `run_ogun.bat --hardware-info`, plus your Windows version and Ollama model.
       render: text
     validations:
       required: true

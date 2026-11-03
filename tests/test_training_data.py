@@ -1,4 +1,4 @@
-"""tests/test_prepare_training_data.py - Verification for Helix DPO data pipeline.
+"""tests/test_prepare_training_data.py - Verification for Ogun DPO data pipeline.
 
 Tests:
 - All dataset mappers (Vezora, jondurbin, CyberNative, stack-exchange, UltraFeedback, dpo-mix)
@@ -27,11 +27,11 @@ import sys
 import tempfile
 import urllib.error
 
-HELIX_ROOT = Path(__file__).resolve().parents[1]
-if str(HELIX_ROOT / "training") not in sys.path:
-    sys.path.insert(0, str(HELIX_ROOT / "training"))
-if str(HELIX_ROOT) not in sys.path:
-    sys.path.insert(0, str(HELIX_ROOT))
+OGUN_ROOT = Path(__file__).resolve().parents[1]
+if str(OGUN_ROOT / "training") not in sys.path:
+    sys.path.insert(0, str(OGUN_ROOT / "training"))
+if str(OGUN_ROOT) not in sys.path:
+    sys.path.insert(0, str(OGUN_ROOT))
 
 import prepare_training_data as ptd
 
@@ -713,7 +713,7 @@ if __name__ == "__main__":
     passes = 0
     fails = 0
     print("=" * 70)
-    print("        Running Helix Training Data Pipeline Tests")
+    print("        Running Ogun Training Data Pipeline Tests")
     print("=" * 70)
 
     for test_fn in tests:

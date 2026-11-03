@@ -1,4 +1,4 @@
-"""Helix path security guard preventing AI operations from modifying engine or system files.
+"""Ogun path security guard preventing AI operations from modifying engine or system files.
 
 Strict path validation:
 Any write tool invoked by the AI must resolve exclusively to:
@@ -6,7 +6,7 @@ Any write tool invoked by the AI must resolve exclusively to:
   - plugins/tests/
   - workspace/
 
-All other destinations (including helix_core/, training/, main.py, .bat scripts,
+All other destinations (including ogun_core/, training/, main.py, .bat scripts,
 and plugins/registry.json) are strictly immutable.
 """
 from __future__ import annotations
@@ -15,10 +15,10 @@ import os
 from pathlib import Path
 from typing import List, Optional, Union
 
-from helix_core.paths import (
+from ogun_core.paths import (
     CUSTOM_TOOLS_DIR,
-    HELIX_CORE_DIR,
-    HELIX_ROOT,
+    OGUN_CORE_DIR,
+    OGUN_ROOT,
     PLUGINS_TESTS_DIR,
     REGISTRY_PATH,
     TRAINING_DIR,
@@ -34,8 +34,8 @@ class PathSecurityGuard:
         base_dir: Optional[Path] = None,
         allowed_dirs: Optional[List[Path]] = None,
     ) -> None:
-        self.base_dir = (base_dir or HELIX_ROOT).resolve()
-        self.core_dir = (self.base_dir / "helix_core").resolve()
+        self.base_dir = (base_dir or OGUN_ROOT).resolve()
+        self.core_dir = (self.base_dir / "ogun_core").resolve()
         self.training_dir = (self.base_dir / "training").resolve()
         self.registry_path = (self.base_dir / "plugins" / "registry.json").resolve()
         self.main_file = (self.base_dir / "main.py").resolve()
@@ -100,7 +100,7 @@ class PathSecurityGuard:
         """Validate write target.
 
         Raises PermissionError if:
-          - The path targets helix_core/ or any file within it
+          - The path targets ogun_core/ or any file within it
           - The path targets training/ or any file within it
           - The path targets main.py, registry.json, or any .bat file
           - The path is outside plugins/custom_tools/, plugins/tests/, or workspace/

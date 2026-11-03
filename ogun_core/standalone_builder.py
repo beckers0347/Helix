@@ -1,4 +1,4 @@
-"""Helix standalone project staged builder and self-correction loop.
+"""Ogun standalone project staged builder and self-correction loop.
 
 Coordinates staged code generation (tool implementation, then unit tests),
 runtime smoke tests, and iterative self-correction with bounded retries.
@@ -18,11 +18,11 @@ import subprocess
 import sys
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
-from helix_core.codetools import run_python_test
-from helix_core.config import SYSTEM_PROMPT, get_request_timeout
-from helix_core.engine import CoreEngine
-from helix_core.paths import HELIX_ROOT
-from helix_core.quality import (
+from ogun_core.codetools import run_python_test
+from ogun_core.config import SYSTEM_PROMPT, get_request_timeout
+from ogun_core.engine import CoreEngine
+from ogun_core.paths import OGUN_ROOT
+from ogun_core.quality import (
     BuildStatus,
     OracleRegistry,
     ParsedUnittestSummary,
@@ -61,7 +61,7 @@ from helix_core.quality import (
 )
 
 
-WORKSPACE_DIR = HELIX_ROOT / "workspace"
+WORKSPACE_DIR = OGUN_ROOT / "workspace"
 
 
 SCAFFOLD_TEMPLATE = '''"""Automated test scaffold for __PROJECT_NAME__.py.
@@ -1104,7 +1104,7 @@ def build_standalone_project_staged(
     def _notify(msg: str, prog: int = -1):
         if on_progress:
             on_progress(msg, prog)
-        print(f"[Helix Builder] {msg}", flush=True)
+        print(f"[Ogun Builder] {msg}", flush=True)
 
     _notify(f"Initializing standalone project '{project_name}' in {project_dir}", 10)
     write_scaffold_file(project_dir, project_name)
@@ -1313,7 +1313,7 @@ def build_standalone_project_staged(
                 fb_parts.append("MEMORY: " + mem_report)
             if tool_code and not smoke_ok:
                 try:
-                    from helix_core.quality import build_expected_output_example
+                    from ogun_core.quality import build_expected_output_example
                     example = build_expected_output_example(request_text, tool_path, project_dir)
                     if example:
                         fb_parts.append(example)
@@ -1329,7 +1329,7 @@ def build_standalone_project_staged(
             fixtures_guide = fix_info.get("prompt_fixtures_summary", "")
 
             prompt = (
-                f"You are Helix, an expert software engineer.\n"
+                f"You are Ogun, an expert software engineer.\n"
                 f"Write comprehensive unit tests in `test_{project_name}.py` verifying `{project_name}.py` against this user request:\n"
                 f"\"\"\"{request_text}\"\"\"\n\n"
                 f"Here is the implementation of `{project_name}.py`:\n```python\n{tool_code}\n```\n\n"

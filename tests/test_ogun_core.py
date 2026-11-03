@@ -1,4 +1,4 @@
-"""Comprehensive offline unit and integration test suite for Helix Core.
+"""Comprehensive offline unit and integration test suite for Ogun Core.
 
 Runs completely offline: zero network calls, zero model inference, zero pytest dependencies.
 All filesystem mutations execute inside isolated tempfile.TemporaryDirectory() environments.
@@ -16,24 +16,24 @@ import tempfile
 import time
 from typing import Any, Dict, List
 
-# Ensure Helix root is on sys.path
-HELIX_ROOT = Path(__file__).resolve().parents[1]
-if str(HELIX_ROOT) not in sys.path:
-    sys.path.insert(0, str(HELIX_ROOT))
+# Ensure Ogun root is on sys.path
+OGUN_ROOT = Path(__file__).resolve().parents[1]
+if str(OGUN_ROOT) not in sys.path:
+    sys.path.insert(0, str(OGUN_ROOT))
 
-from helix_core.base_tool import BaseTool, ToolResult
-from helix_core.codetools import (
+from ogun_core.base_tool import BaseTool, ToolResult
+from ogun_core.codetools import (
     check_syntax,
     read_file,
     replace_in_file,
     run_python_test,
     write_file,
 )
-from helix_core.config import NUM_CTX
-from helix_core.engine import ContextManager, CoreEngine
-from helix_core.plugin_manager import PluginManager, normalize_plugin_name
-from helix_core.security import PathSecurityGuard
-from helix_core.toolcalls import parse_tool_calls
+from ogun_core.config import NUM_CTX
+from ogun_core.engine import ContextManager, CoreEngine
+from ogun_core.plugin_manager import PluginManager, normalize_plugin_name
+from ogun_core.security import PathSecurityGuard
+from ogun_core.toolcalls import parse_tool_calls
 from test_harness import extract_python_blocks
 
 
@@ -129,14 +129,14 @@ def test_security_guard() -> None:
 
         # 2. Path traversal attempts
         try:
-            guard.validate_write(root / "plugins" / "custom_tools" / ".." / ".." / "helix_core" / "evil.py")
+            guard.validate_write(root / "plugins" / "custom_tools" / ".." / ".." / "ogun_core" / "evil.py")
             assert False, "Should have raised PermissionError for traversal to core"
         except PermissionError:
             pass
 
         # 3. Windows mixed case normalization
         try:
-            guard.validate_write(root / "HELIX_CORE" / "evil.py")
+            guard.validate_write(root / "OGUN_CORE" / "evil.py")
             assert False, "Should have raised PermissionError for mixed case core"
         except PermissionError:
             pass
@@ -165,11 +165,11 @@ def test_security_guard() -> None:
         # 7. Core files, main.py, registry.json, and batch scripts immutability
         blocked_targets = [
             root / "main.py",
-            root / "run_helix.bat",
+            root / "run_ogun.bat",
             root / "test_plugin_builder.bat",
             root / "plugins" / "registry.json",
             root / "training" / "prepare_training_data.py",
-            root / "helix_core" / "paths.py",
+            root / "ogun_core" / "paths.py",
         ]
         for target in blocked_targets:
             try:
@@ -225,7 +225,7 @@ def test_ast_validation() -> None:
     """Test PluginManager AST checks for stubs, comments, and placeholders."""
     # 1. Valid code
     valid_code = """
-from helix_core.base_tool import BaseTool, ToolResult
+from ogun_core.base_tool import BaseTool, ToolResult
 
 class GoodTool(BaseTool):
     name = "good_tool"
@@ -244,7 +244,7 @@ class GoodTool(BaseTool):
 
     # 3. Placeholder string
     mock_str_code = """
-from helix_core.base_tool import BaseTool, ToolResult
+from ogun_core.base_tool import BaseTool, ToolResult
 class MockTool(BaseTool):
     name = "mock_tool"
     def execute(self, **kwargs):
@@ -256,7 +256,7 @@ class MockTool(BaseTool):
 
     # 4. Pass-only method
     pass_code = """
-from helix_core.base_tool import BaseTool, ToolResult
+from ogun_core.base_tool import BaseTool, ToolResult
 class StubTool(BaseTool):
     name = "stub_tool"
     def execute(self, **kwargs):
@@ -268,7 +268,7 @@ class StubTool(BaseTool):
 
     # 5. NotImplementedError
     nie_code = """
-from helix_core.base_tool import BaseTool, ToolResult
+from ogun_core.base_tool import BaseTool, ToolResult
 class NieTool(BaseTool):
     name = "nie_tool"
     def execute(self, **kwargs):
@@ -316,7 +316,7 @@ def test_plugin_lifecycle_and_registry_safety() -> None:
 from __future__ import annotations
 import sys
 from pathlib import Path
-from helix_core.base_tool import BaseTool, ToolResult
+from ogun_core.base_tool import BaseTool, ToolResult
 
 class AdderTool(BaseTool):
     name: str = "adder_tool"
@@ -334,10 +334,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Add Helix root to sys.path
-HELIX_ROOT = Path(r"{HELIX_ROOT}")
-if str(HELIX_ROOT) not in sys.path:
-    sys.path.insert(0, str(HELIX_ROOT))
+# Add Ogun root to sys.path
+OGUN_ROOT = Path(r"{OGUN_ROOT}")
+if str(OGUN_ROOT) not in sys.path:
+    sys.path.insert(0, str(OGUN_ROOT))
 
 # Add temporary custom_tools to sys.path
 TOOLS_DIR = Path(r"{tools_dir}")
@@ -503,9 +503,9 @@ def test_a():
 
 def test_vram_config_and_options() -> None:
     import importlib
-    import helix_core.config as cfg
+    import ogun_core.config as cfg
 
-    keys = ("HELIX_KEEP_ALIVE", "HELIX_NUM_GPU", "HELIX_VRAM_PROFILE")
+    keys = ("OGUN_KEEP_ALIVE", "OGUN_NUM_GPU", "OGUN_VRAM_PROFILE")
     saved = {k: os.environ.get(k) for k in keys}
     try:
         for k in keys:
@@ -533,18 +533,18 @@ def test_vram_config_and_options() -> None:
         assert cfg.set_vram_profile("cpu")[3] == 0 and cfg.llm_options()["num_gpu"] == 0 and "num_gpu" in cfg.llm_options()
 
         # environment: profile name, custom layer count, 'auto' omits, garbage falls back (never raises)
-        os.environ["HELIX_VRAM_PROFILE"] = "max"
+        os.environ["OGUN_VRAM_PROFILE"] = "max"
         importlib.reload(cfg)
         assert cfg.get_vram_profile() == "MAX_PERFORMANCE"
-        os.environ["HELIX_VRAM_PROFILE"] = "banana"
+        os.environ["OGUN_VRAM_PROFILE"] = "banana"
         importlib.reload(cfg)
         assert cfg.get_vram_profile() == "SHARED_VRAM"
-        os.environ.pop("HELIX_VRAM_PROFILE", None)
-        os.environ["HELIX_NUM_GPU"] = "12"
+        os.environ.pop("OGUN_VRAM_PROFILE", None)
+        os.environ["OGUN_NUM_GPU"] = "12"
         importlib.reload(cfg)
         assert cfg.get_vram_profile() == "CUSTOM(12)" and cfg.llm_options()["num_gpu"] == 12
-        os.environ["HELIX_NUM_GPU"] = "auto"
-        os.environ["HELIX_KEEP_ALIVE"] = "10m"
+        os.environ["OGUN_NUM_GPU"] = "auto"
+        os.environ["OGUN_KEEP_ALIVE"] = "10m"
         importlib.reload(cfg)
         assert cfg.get_num_gpu() is None and "num_gpu" not in cfg.llm_options() and cfg.KEEP_ALIVE == "10m"
         assert cfg._parse_num_gpu("banana") == 24 and cfg._parse_num_gpu("-5") == 24 and cfg._parse_num_gpu("") == 24
@@ -574,8 +574,8 @@ def _fake_ollama_module(seen):
 
 
 def test_engine_sends_identical_load_options_and_unloads() -> None:
-    import helix_core.config as cfg
-    import helix_core.engine as eng
+    import ogun_core.config as cfg
+    import ogun_core.engine as eng
 
     cfg.set_vram_profile("shared")
     seen = []
@@ -632,8 +632,8 @@ def test_engine_sends_identical_load_options_and_unloads() -> None:
 
 def test_vram_toggle_reaches_every_chat_call() -> None:
     """After /vram changes the profile, the VERY NEXT chat() payload carries the new num_gpu (nothing caches the old one)."""
-    import helix_core.config as cfg
-    import helix_core.engine as eng
+    import ogun_core.config as cfg
+    import ogun_core.engine as eng
 
     seen = []
     saved_mod = sys.modules.get("ollama")
@@ -655,8 +655,8 @@ def test_vram_toggle_reaches_every_chat_call() -> None:
 
 def test_vram_commands() -> None:
     import urllib.request
-    import helix_core.config as cfg
-    import helix_core.engine as eng
+    import ogun_core.config as cfg
+    import ogun_core.engine as eng
 
     for text in ("/vram", "/vram shared", "/VRAM Max", "  /vram free ", "/vram status", "/vram cpu", "/vram banana"):
         assert eng.is_vram_command(text), text
@@ -726,34 +726,34 @@ def test_vram_commands() -> None:
 
 
 def test_main_unload_command_cli_and_no_stale_keepalive() -> None:
-    import main as helix_main
+    import main as ogun_main
 
     for phrase in ("unload the model", "Free the GPU", "free up VRAM?", "/unload", "release gpu memory"):
-        assert helix_main.is_unload_command(phrase), phrase
+        assert ogun_main.is_unload_command(phrase), phrase
     for phrase in ("unload the dishwasher", "what is vram", "please free some memory in my script", "", "unload model foo.py"):
-        assert not helix_main.is_unload_command(phrase), phrase
+        assert not ogun_main.is_unload_command(phrase), phrase
 
     # --unload is handled before the connection check, workspace setup or any engine construction
     calls = {"unload": 0, "check": 0}
-    orig_unload, orig_check, orig_argv = helix_main.unload_model, helix_main.OllamaClient.check_connection, sys.argv
-    helix_main.unload_model = lambda model=None: calls.__setitem__("unload", calls["unload"] + 1) or {"unloaded": True, "detail": "done"}
-    helix_main.OllamaClient.check_connection = lambda self: calls.__setitem__("check", calls["check"] + 1) or (False, "down")
+    orig_unload, orig_check, orig_argv = ogun_main.unload_model, ogun_main.OllamaClient.check_connection, sys.argv
+    ogun_main.unload_model = lambda model=None: calls.__setitem__("unload", calls["unload"] + 1) or {"unloaded": True, "detail": "done"}
+    ogun_main.OllamaClient.check_connection = lambda self: calls.__setitem__("check", calls["check"] + 1) or (False, "down")
     sys.argv = ["main.py", "--unload"]
     try:
         try:
-            helix_main.main()
+            ogun_main.main()
             raise AssertionError("main() should exit")
         except SystemExit as exit_:
             assert exit_.code == 0
     finally:
-        helix_main.unload_model, helix_main.OllamaClient.check_connection, sys.argv = orig_unload, orig_check, orig_argv
+        ogun_main.unload_model, ogun_main.OllamaClient.check_connection, sys.argv = orig_unload, orig_check, orig_argv
     assert calls == {"unload": 1, "check": 0}, calls
 
-    # nothing in Helix may still carry the old 30-minute keep-alive
+    # nothing in Ogun may still carry the old 30-minute keep-alive
     root = Path(__file__).resolve().parents[1]
     offenders = []
     for py in root.rglob("*.py"):
-        if ".venv" in py.parts or ".venv-train" in py.parts or "__pycache__" in py.parts or py.name == "test_helix_core.py":
+        if ".venv" in py.parts or ".venv-train" in py.parts or "__pycache__" in py.parts or py.name == "test_ogun_core.py":
             continue
         text = py.read_text(encoding="utf-8", errors="replace")
         if '"30m"' in text or "'30m'" in text:
@@ -780,7 +780,7 @@ def run_all_tests() -> bool:
     ]
 
     print("=" * 60)
-    print("  Helix Core Offline Test Suite")
+    print("  Ogun Core Offline Test Suite")
     print("=" * 60)
 
     passes = 0

@@ -1,4 +1,4 @@
-"""Helix dynamic plugin manager.
+"""Ogun dynamic plugin manager.
 
 Handles plugin discovery, AST pre-flight validation, isolated subprocess unit testing,
 hot-reloading, execution sandboxing, quarantine, and safe registry persistence.
@@ -20,15 +20,15 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from helix_core.base_tool import BaseTool, ToolResult
-from helix_core.paths import (
+from ogun_core.base_tool import BaseTool, ToolResult
+from ogun_core.paths import (
     CUSTOM_TOOLS_DIR,
-    HELIX_ROOT,
+    OGUN_ROOT,
     PLUGINS_TESTS_DIR,
     QUARANTINE_DIR,
     REGISTRY_PATH,
 )
-from helix_core.security import PathSecurityGuard
+from ogun_core.security import PathSecurityGuard
 
 _PLACEHOLDER_COMMENT_RE = re.compile(
     r"#\s*(?:placeholder\b|todo\b|mock\b|dummy\b|stub\b|to be implemented|replace with actual|in a real implementation)",
@@ -50,7 +50,7 @@ def normalize_plugin_name(name: str) -> str:
 
 
 class PluginManager:
-    """Dynamic lifecycle manager for Helix plugins and tools."""
+    """Dynamic lifecycle manager for Ogun plugins and tools."""
 
     def __init__(
         self,
@@ -61,7 +61,7 @@ class PluginManager:
         base_dir: Optional[Path] = None,
         default_timeout: float = 30.0,
     ) -> None:
-        self.base_dir = (base_dir or HELIX_ROOT).resolve()
+        self.base_dir = (base_dir or OGUN_ROOT).resolve()
         self.custom_tools_dir = (custom_tools_dir or (self.base_dir / "plugins" / "custom_tools")).resolve()
         self.tests_dir = (tests_dir or (self.base_dir / "plugins" / "tests")).resolve()
         self.quarantine_dir = (quarantine_dir or (self.base_dir / "plugins" / "quarantine")).resolve()
@@ -249,8 +249,8 @@ class PluginManager:
         env["PYTHONUTF8"] = "1"
         sep = ";" if sys.platform == "win32" else ":"
         paths = [str(self.base_dir)]
-        if str(HELIX_ROOT) != str(self.base_dir):
-            paths.append(str(HELIX_ROOT))
+        if str(OGUN_ROOT) != str(self.base_dir):
+            paths.append(str(OGUN_ROOT))
         existing_pp = env.get("PYTHONPATH")
         if existing_pp:
             paths.append(existing_pp)
@@ -281,7 +281,7 @@ class PluginManager:
         """Dynamically load and instantiate a BaseTool subclass from a Python file."""
         if not tool_path.exists():
             return None
-        module_name = f"helix_plugin_{tool_path.stem}"
+        module_name = f"ogun_plugin_{tool_path.stem}"
         try:
             spec = importlib.util.spec_from_file_location(module_name, str(tool_path))
             if spec is None or spec.loader is None:
@@ -401,10 +401,10 @@ class PluginManager:
         plugins_dir = self.custom_tools_dir.parent
         plugins_init = plugins_dir / "__init__.py"
         if not plugins_init.exists():
-            plugins_init.write_text("# Helix dynamic plugins package\n", encoding="utf-8")
+            plugins_init.write_text("# Ogun dynamic plugins package\n", encoding="utf-8")
         tools_init = self.custom_tools_dir / "__init__.py"
         if not tools_init.exists():
-            tools_init.write_text("# Helix custom tools package\n", encoding="utf-8")
+            tools_init.write_text("# Ogun custom tools package\n", encoding="utf-8")
 
         # Write files
         tool_file.write_text(code, encoding="utf-8")

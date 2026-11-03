@@ -2,7 +2,7 @@
 
 Standalone, portable hardware discovery and LLM inference auto-configurator.
 Compatible with Python 3.10+ standard library. psutil is an optional accelerator.
-No external framework dependencies, no Helix-specific imports, no side effects at import.
+No external framework dependencies, no Ogun-specific imports, no side effects at import.
 """
 from __future__ import annotations
 
@@ -1160,7 +1160,7 @@ def format_banner(
 
     lines = [
         "======================================================================",
-        "                     HELIX HARDWARE PROFILE & RUNTIME",
+        "                     OGUN HARDWARE PROFILE & RUNTIME",
         "======================================================================",
         f"  CPU:        {hw.cpu_name} ({hw.cpu_physical}C / {hw.cpu_logical}T, {isa_str})",
         f"  System RAM: {hw.ram_total_gb:.1f} GB Total | {hw.ram_available_gb:.1f} GB Available",

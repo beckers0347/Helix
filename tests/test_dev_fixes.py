@@ -1,4 +1,4 @@
-"""Offline unit and integration tests for Helix development-ability fixes (F1 - F7).
+"""Offline unit and integration tests for Ogun development-ability fixes (F1 - F7).
 
 Runs completely offline: zero network calls, zero live model inference.
 Tests all honesty verification, continuation handling, standalone routing,
@@ -15,30 +15,30 @@ import tempfile
 from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 
-# Ensure Helix root is on sys.path
-HELIX_ROOT = Path(__file__).resolve().parents[1]
-if str(HELIX_ROOT) not in sys.path:
-    sys.path.insert(0, str(HELIX_ROOT))
+# Ensure Ogun root is on sys.path
+OGUN_ROOT = Path(__file__).resolve().parents[1]
+if str(OGUN_ROOT) not in sys.path:
+    sys.path.insert(0, str(OGUN_ROOT))
 
-from helix_core.base_tool import BaseTool, ToolResult
-from helix_core.config import (
+from ogun_core.base_tool import BaseTool, ToolResult
+from ogun_core.config import (
     SYSTEM_PROMPT,
     get_request_timeout,
     set_vram_profile,
 )
-from helix_core.engine import CoreEngine, OllamaClient
-from helix_core.hardware import (
+from ogun_core.engine import CoreEngine, OllamaClient
+from ogun_core.hardware import (
     GpuInfo,
     HardwareInfo,
     adjust_for_resident_models,
     format_banner,
     _probe_nvidia_gpus,
 )
-from helix_core.honesty import TurnEvents, sanitize_reply
-from helix_core.plugin_builder import build_plugin_staged
-from helix_core.plugin_manager import PluginManager
-from helix_core.quality import check_requirements_coverage, classify_project_request
-from helix_core.security import PathSecurityGuard
+from ogun_core.honesty import TurnEvents, sanitize_reply
+from ogun_core.plugin_builder import build_plugin_staged
+from ogun_core.plugin_manager import PluginManager
+from ogun_core.quality import check_requirements_coverage, classify_project_request
+from ogun_core.security import PathSecurityGuard
 
 
 # -----------------------------------------------------------------------------
@@ -130,7 +130,7 @@ def test_f1_honesty_guard_intercepts_fabricated_reply() -> None:
     assert "This confirms that the `dupefinder` tool and its tests are working correctly" not in sanitized
     # Honest notice must be included
     assert "No files were written to disk" in sanitized
-    assert "No tests were executed by Helix" in sanitized
+    assert "No tests were executed by Ogun" in sanitized
 
 
 def test_f1_honesty_guard_passes_genuine_reply() -> None:
@@ -214,9 +214,9 @@ def test_f3_project_classification() -> None:
         "Build me a cli tool that parses JSON.",
     ]
     plugin_prompts = [
-        "Create a dynamic plugin for Helix named StringHasher.",
-        "Build a plugin that adds web scraping to Helix.",
-        "Add tool to helix inheriting from BaseTool.",
+        "Create a dynamic plugin for Ogun named StringHasher.",
+        "Build a plugin that adds web scraping to Ogun.",
+        "Add tool to ogun inheriting from BaseTool.",
     ]
 
     for p in standalone_prompts:
@@ -240,8 +240,8 @@ def test_f3_standalone_workspace_write_and_security_guard() -> None:
 
         # Forbidden writes
         try:
-            guard.validate_write(root / "helix_core" / "engine.py")
-            assert False, "Should have rejected write to helix_core"
+            guard.validate_write(root / "ogun_core" / "engine.py")
+            assert False, "Should have rejected write to ogun_core"
         except PermissionError:
             pass
 
@@ -268,7 +268,7 @@ def test_f4_adaptive_timeouts_by_hardware_profile() -> None:
     assert get_request_timeout() == 900.0
 
     # Environment variable override
-    with patch.dict(os.environ, {"HELIX_REQUEST_TIMEOUT": "150.0"}):
+    with patch.dict(os.environ, {"OGUN_REQUEST_TIMEOUT": "150.0"}):
         assert get_request_timeout() == 150.0
 
     # Reset profile
@@ -298,7 +298,7 @@ def test_f5_self_correction_fails_then_fixes() -> None:
 
         # Attempt 1: Syntax error in test
         bad_tool = """```python
-from helix_core.base_tool import BaseTool, ToolResult
+from ogun_core.base_tool import BaseTool, ToolResult
 class AdderTool(BaseTool):
     name: str = "adder_tool"
     version: str = "1.0.0"
@@ -314,7 +314,7 @@ this is invalid python syntax syntax !!!
 
         # Attempt 2: Fixed code
         good_tool = """```python
-from helix_core.base_tool import BaseTool, ToolResult
+from ogun_core.base_tool import BaseTool, ToolResult
 class AdderTool(BaseTool):
     name: str = "adder_tool"
     version: str = "1.0.0"
@@ -439,8 +439,8 @@ def test_f7_nvidia_smi_garbage_rejection() -> None:
         "4, GPU Valid, 12288.0, 10240.0, 550.00\n"
     )
 
-    with patch("helix_core.hardware._find_nvidia_smi", return_value="nvidia-smi"):
-        with patch("helix_core.hardware._run_subproc", return_value=(0, garbage_csv)):
+    with patch("ogun_core.hardware._find_nvidia_smi", return_value="nvidia-smi"):
+        with patch("ogun_core.hardware._run_subproc", return_value=(0, garbage_csv)):
             notes: List[str] = []
             gpus = _probe_nvidia_gpus(2.0, notes)
 
@@ -479,7 +479,7 @@ def test_f7_format_banner_omits_invalid_figures() -> None:
         notes=[],
     )
 
-    from helix_core.hardware import auto_configure
+    from ogun_core.hardware import auto_configure
     prof = auto_configure(hw)
     banner = format_banner(hw, prof)
 
@@ -531,8 +531,8 @@ def test_f7_adjust_resident_models_clamps_safely() -> None:
 
 def test_h1_windows_unicode_cp1252_smoke_and_static_check() -> None:
     """H1: Windows Unicode / cp1252 safety static check and runtime smoke test."""
-    from helix_core.quality import check_requirements_coverage
-    from helix_core.standalone_builder import run_smoke_tests
+    from ogun_core.quality import check_requirements_coverage
+    from ogun_core.standalone_builder import run_smoke_tests
 
     # Missing stdout configuration triggers static coverage failure for CLI tool
     bad_cli = "import argparse\nparser = argparse.ArgumentParser()\nargs = parser.parse_args()\nprint('hello')\n"
@@ -563,7 +563,7 @@ def test_h1_windows_unicode_cp1252_smoke_and_static_check() -> None:
 
 def test_h2_nonexistent_path_nonzero_exit_smoke_check() -> None:
     """H2: Nonexistent path must exit non-zero and write to stderr."""
-    from helix_core.standalone_builder import run_smoke_tests
+    from ogun_core.standalone_builder import run_smoke_tests
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         p_dir = Path(tmp_dir)
@@ -586,8 +586,8 @@ def test_h2_nonexistent_path_nonzero_exit_smoke_check() -> None:
 
 def test_h3_standalone_staged_builder_success_and_failure() -> None:
     """H3: Standalone staged builder tests real behavior, diagnoses test-vs-tool, and reports truthfully."""
-    from helix_core.standalone_builder import build_standalone_project_staged
-    from helix_core.engine import CoreEngine
+    from ogun_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.engine import CoreEngine
 
     class MockEngineClient:
         def __init__(self, responses: List[str]) -> None:
@@ -597,7 +597,7 @@ def test_h3_standalone_staged_builder_success_and_failure() -> None:
                 return {"content": self.responses.pop(0)}
             return {"content": "no response"}
 
-    mocktool_dir = HELIX_ROOT / "workspace" / "mocktool"
+    mocktool_dir = OGUN_ROOT / "workspace" / "mocktool"
     if mocktool_dir.exists():
         shutil.rmtree(mocktool_dir, ignore_errors=True)
 
@@ -637,7 +637,7 @@ def test_h3_standalone_staged_builder_success_and_failure() -> None:
 
 def test_h3_round_limit_rich_status() -> None:
     """H3 (a): When turn round limit is hit, final message reports files written and test status."""
-    from helix_core.engine import CoreEngine
+    from ogun_core.engine import CoreEngine
 
     class LoopingClient:
         def chat(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -650,7 +650,7 @@ def test_h3_round_limit_rich_status() -> None:
 
 def test_adversarial_honesty_and_resume() -> None:
     """Honesty guard intercepts alternative claim phrasings, and resume detection does not hijack unrelated chat."""
-    from helix_core.honesty import TurnEvents, sanitize_reply
+    from ogun_core.honesty import TurnEvents, sanitize_reply
 
     text = "I've saved the code to workspace/tool/tool.py and all green! Tests are passing ✅"
     events = TurnEvents()
@@ -673,7 +673,7 @@ def test_adversarial_honesty_and_resume() -> None:
 def test_r3_fix_stage_no_blocks_escalation() -> None:
     """R3-1 / R3-2: When fix stage returns no code blocks, failure is logged and strategy rotates."""
     import tempfile, shutil
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.standalone_builder import build_standalone_project_staged
 
     good_tool = """
 import sys, argparse
@@ -703,7 +703,7 @@ if __name__ == '__main__':
     engine = CoreEngine(client=client)
 
     test_dir = tempfile.mkdtemp()
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called mocktool. It needs a --json option.",
@@ -719,7 +719,7 @@ if __name__ == '__main__':
 def test_r3_fix_stage_rejects_stub_and_preserves_tool() -> None:
     """R3-1 / R3-2: When fix stage returns a degenerate stub, regression guard rejects it and preserves original tool."""
     import tempfile, shutil
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.standalone_builder import build_standalone_project_staged
 
     good_tool = """
 import sys, os, argparse
@@ -761,7 +761,7 @@ print('Done')
     engine = CoreEngine(client=client)
 
     test_dir = tempfile.mkdtemp()
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called mocktool. It needs a --json option.",
@@ -781,7 +781,7 @@ print('Done')
 def test_r3_per_attempt_tracing_records_all_fields() -> None:
     """R3-1: Per-attempt tracing under <project_dir>/.build_log/attempt_N/ records all artifacts."""
     import json, tempfile, shutil
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.standalone_builder import build_standalone_project_staged
 
     good_tool = """
 import sys, os, argparse
@@ -816,7 +816,7 @@ if __name__ == '__main__':
     engine = CoreEngine(client=client)
 
     test_dir = tempfile.mkdtemp()
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called mocktool. It needs a --json option.",
@@ -842,7 +842,7 @@ if __name__ == '__main__':
 def test_r3_stuck_failures_rotate_strategy_and_converge() -> None:
     """R3-3: Stuck test set failure rotates strategy to regenerate_tests_only and converges."""
     import tempfile, shutil
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.standalone_builder import build_standalone_project_staged
 
     good_tool = """
 import sys, os, argparse
@@ -899,7 +899,7 @@ if __name__ == '__main__':
     engine = CoreEngine(client=client)
 
     test_dir = tempfile.mkdtemp()
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called mocktool. It needs a --json option.",
@@ -913,7 +913,7 @@ if __name__ == '__main__':
 def test_r3_regression_rollback_to_best_so_far() -> None:
     """R3-3: Best-so-far candidate is tracked; regressed attempt triggers rollback to best candidate."""
     import tempfile, shutil
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.standalone_builder import build_standalone_project_staged
 
     good_tool = """
 import sys, os, argparse
@@ -973,7 +973,7 @@ if __name__ == '__main__':
     engine = CoreEngine(client=client)
 
     test_dir = tempfile.mkdtemp()
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called mocktool. It needs a --json option and a --strict option.",
@@ -988,7 +988,7 @@ if __name__ == '__main__':
 
 def test_r3_test_hygiene_static_check() -> None:
     """R3-2: check_test_code_hygiene enforces encoding, absolute path, and non-zero exit."""
-    from helix_core.quality import check_test_code_hygiene
+    from ogun_core.quality import check_test_code_hygiene
 
     bad_enc = "subprocess.run([sys.executable, 'tool.py'], capture_output=True, text=True)"
     ok, issues = check_test_code_hygiene(bad_enc, "tool")
@@ -1020,7 +1020,7 @@ class T(unittest.TestCase):
 
 def test_r3_honesty_guard_legitimate_failure_not_rewritten() -> None:
     """R3-4: Honest failure report with real test output is preserved without disclaimers."""
-    from helix_core.honesty import TurnEvents, sanitize_reply
+    from ogun_core.honesty import TurnEvents, sanitize_reply
 
     honest_failure_reply = (
         "Failed to build `dupefinder`: tests still failing after 2 attempts (1 test(s) remaining).\n\n"
@@ -1050,7 +1050,7 @@ def test_r3_honesty_guard_legitimate_failure_not_rewritten() -> None:
 def test_r4_timeout_in_test_stage_preserves_tool() -> None:
     """R4-1: Timeout during test generation preserves tool code and resumes in attempt 2."""
     import tempfile, shutil
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.standalone_builder import build_standalone_project_staged
 
     tool_code = """
 import sys, os, argparse
@@ -1092,7 +1092,7 @@ if __name__ == '__main__':
     proj_dir = Path(test_dir) / "workspace" / "dupefinder"
     proj_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called dupefinder. It needs a --json option.",
@@ -1108,7 +1108,7 @@ if __name__ == '__main__':
 def test_r4_all_attempts_timeout_truthfully_reports_files() -> None:
     """R4-1: If all attempts time out, builder truthfully reports timeouts and names files on disk."""
     import tempfile, shutil
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.standalone_builder import build_standalone_project_staged
 
     class AllTimeoutClient:
         def chat(self, messages: Any, tools: Any = None) -> Dict[str, Any]:
@@ -1119,7 +1119,7 @@ def test_r4_all_attempts_timeout_truthfully_reports_files() -> None:
     proj_dir = Path(test_dir) / "workspace" / "dupefinder"
     proj_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called dupefinder. It needs a --json option.",
@@ -1135,7 +1135,7 @@ def test_r4_all_attempts_timeout_truthfully_reports_files() -> None:
 def test_r4_timeout_in_fix_stage_preserves_files() -> None:
     """R4-1: Timeout during self-correction fix preserves tool and test files on disk and records in build log."""
     import tempfile, shutil
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.standalone_builder import build_standalone_project_staged
 
     tool_code = """
 import sys, os, argparse
@@ -1176,7 +1176,7 @@ if __name__ == '__main__':
     proj_dir = Path(test_dir) / "workspace" / "dupefinder"
     proj_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called dupefinder. It needs a --json option.",
@@ -1194,8 +1194,8 @@ if __name__ == '__main__':
 def test_r4_arbitration_locks_tool_sha_on_test_defect() -> None:
     """R4-3: Arbitration classifies test defect and locks tool SHA256; candidate tool update is rejected."""
     import tempfile, shutil
-    from helix_core.quality import arbitrate_test_failure
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.quality import arbitrate_test_failure
+    from ogun_core.standalone_builder import build_standalone_project_staged
 
     good_tool = """
 import sys, os, argparse
@@ -1247,7 +1247,7 @@ if __name__ == '__main__':
     client = MockChatClient(responses)
     engine = CoreEngine(client=client)
 
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called dupefinder. It needs a --json option.",
@@ -1262,7 +1262,7 @@ if __name__ == '__main__':
 
 def test_r4_hygiene_static_checks_r4_rules() -> None:
     """R4-2: Static hygiene check rejects short assertNotIn, exact multi-space, and missing json.loads."""
-    from helix_core.quality import check_test_code_hygiene
+    from ogun_core.quality import check_test_code_hygiene
 
     # 1. Short assertNotIn (<= 2 chars)
     code1 = """import unittest
@@ -1312,7 +1312,7 @@ class T(unittest.TestCase):
 
 def test_r4_memory_gate_budget_enforcement() -> None:
     """R4-4: Memory budget gate rejects full file reads and enforces memory ceiling."""
-    from helix_core.quality import check_requirements_coverage
+    from ogun_core.quality import check_requirements_coverage
 
     bad_code = """import sys
 def main():
@@ -1326,7 +1326,7 @@ def main():
 def test_r4_quarantine_bad_test_and_skipped_status() -> None:
     """R4-3: Quarantines bad test with @unittest.skip and outputs accurate final status."""
     import tempfile, shutil
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.standalone_builder import build_standalone_project_staged
 
     good_tool = """
 import sys, os, argparse
@@ -1366,7 +1366,7 @@ if __name__ == '__main__':
     proj_dir = Path(test_dir) / "workspace" / "dupefinder"
     proj_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir) / "workspace"):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called dupefinder. It needs a --json option.",
@@ -1386,7 +1386,7 @@ if __name__ == '__main__':
 
 def test_r5_table_alignment_under_max_width_smoke_check() -> None:
     """R5-2: Deterministic smoke test detects misaligned table rows under --max-width."""
-    from helix_core.standalone_builder import run_smoke_tests
+    from ogun_core.standalone_builder import run_smoke_tests
     test_dir = tempfile.mkdtemp()
     proj_dir = Path(test_dir)
     bad_tab = proj_dir / "tablefmt.py"
@@ -1432,7 +1432,7 @@ print("2  | VeryLo.. | HR      ")
 
 def test_r5_whole_document_tool_relaxed_advisory_budget() -> None:
     """R5-1: Whole-document tools (JSON/XML/YAML) receive relaxed advisory memory budget."""
-    from helix_core.quality import classify_tool_input_kind, check_tool_memory_budget
+    from ogun_core.quality import classify_tool_input_kind, check_tool_memory_budget
     assert classify_tool_input_kind("Build tool jsonget for json file", "jsonget") == "whole_document_json"
     assert classify_tool_input_kind("Build tool tabprint for csv file", "tabprint") == "streaming_csv"
     assert classify_tool_input_kind("Build tool dirsize for directory", "dirsize") == "streaming_directory"
@@ -1457,8 +1457,8 @@ if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
 
 def test_r5_identical_regeneration_loop_guard() -> None:
     """R5-1: Loop guard breaks early when model regenerates identical code with same failures."""
-    from helix_core.standalone_builder import build_standalone_project_staged
-    from helix_core.engine import CoreEngine
+    from ogun_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.engine import CoreEngine
 
     identical_tool = """```python
 import sys, argparse
@@ -1491,7 +1491,7 @@ if __name__ == '__main__':
     engine = CoreEngine(client=client)
 
     test_dir = tempfile.mkdtemp()
-    with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
+    with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
         success, msg, details = build_standalone_project_staged(
             engine,
             "Build me a command-line tool called looptool with --flag option",
@@ -1504,7 +1504,7 @@ if __name__ == '__main__':
 
 def test_r5_status_wording_matches_facts_on_disk() -> None:
     """R5-3 & R5-5: Final status wording is derived from facts on disk and matches defined table."""
-    from helix_core.quality import compute_final_status_from_disk
+    from ogun_core.quality import compute_final_status_from_disk
     test_dir = tempfile.mkdtemp()
     proj_dir = Path(test_dir)
 
@@ -1545,7 +1545,7 @@ if __name__ == '__main__':
 
 def test_r5_quarantine_rewrite_before_skip_and_cap() -> None:
     """R5-3: Rewriting is tried before skipping, 25% cap enforced, and sole option tests protected."""
-    from helix_core.quality import quarantine_bad_tests
+    from ogun_core.quality import quarantine_bad_tests
     test_dir = tempfile.mkdtemp()
     proj_dir = Path(test_dir)
     test_path = proj_dir / "test_dirsize.py"
@@ -1579,7 +1579,7 @@ class T(unittest.TestCase):
 
 def test_r5_arbitration_treats_requested_option_failure_as_tool_defect() -> None:
     """R5-5: Arbitration treats test failures on requested options as TOOL defects."""
-    from helix_core.quality import arbitrate_test_failure
+    from ogun_core.quality import arbitrate_test_failure
 
     test_src = """
 def test_keys_option(self):
@@ -1602,7 +1602,7 @@ def test_keys_option(self):
 
 def test_r5_coverage_gap_status_when_option_uncovered() -> None:
     """R5-3: If requested option lacks active tests, status reports COVERAGE GAP."""
-    from helix_core.quality import compute_final_status_from_disk
+    from ogun_core.quality import compute_final_status_from_disk
     test_dir = tempfile.mkdtemp()
     proj_dir = Path(test_dir)
     (proj_dir / "mytool.py").write_text("import sys, argparse\nif sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')\nparser = argparse.ArgumentParser()\nparser.add_argument('file')\nparser.add_argument('--pretty', action='store_true')\nargs = parser.parse_args()\nimport os\nif not os.path.exists(args.file): sys.exit(1)\n", encoding="utf-8")
@@ -1620,7 +1620,7 @@ if __name__ == '__main__': unittest.main()
 
 def test_r6_cli_contract_discovery_multi_arg() -> None:
     """R6-1: Discover CLI contracts for tools with positionals and required/optional flags."""
-    from helix_core.standalone_builder import discover_cli_contract, build_smoke_args, run_smoke_tests
+    from ogun_core.standalone_builder import discover_cli_contract, build_smoke_args, run_smoke_tests
     test_dir = tempfile.mkdtemp()
     proj_dir = Path(test_dir)
     tool_file = proj_dir / "complex_cli.py"
@@ -1662,7 +1662,7 @@ print(f"OK src={args.src} dest={args.dest} config={args.config} count={args.coun
 
 def test_r6_argparse_error_classified_as_harness_error() -> None:
     """R6-1 / R6-4: Argparse usage errors classified as HARNESS_ERROR, never tool defect, tool not locked."""
-    from helix_core.quality import arbitrate_test_failure
+    from ogun_core.quality import arbitrate_test_failure
     test_output = "usage: tool.py [-h] --config CONFIG src dest\ntool.py: error: the following arguments are required: dest"
     arb = arbitrate_test_failure(
         request="Build tool that takes src dest and --config",
@@ -1682,7 +1682,7 @@ def test_r6_argparse_error_classified_as_harness_error() -> None:
 
 def test_r6_scaffold_module_deterministic_helpers() -> None:
     """R6-2: _scaffold.py module provides isolated tmp, runner, write_file, make_dir, and assertions."""
-    from helix_core.standalone_builder import write_scaffold_file
+    from ogun_core.standalone_builder import write_scaffold_file
     test_dir = tempfile.mkdtemp()
     proj_dir = Path(test_dir)
     scaffold_file = write_scaffold_file(proj_dir, "mytool")
@@ -1737,7 +1737,7 @@ print("Standard output from tool")
 
 def test_r6_hygiene_static_check_rules() -> None:
     """R6-2: Static hygiene check requires scaffold, forbids subprocess, rejects trivial assertions."""
-    from helix_core.quality import check_test_code_hygiene
+    from ogun_core.quality import check_test_code_hygiene
 
     bad_no_scaffold = '''import unittest
 class TestTool(unittest.TestCase):
@@ -1783,7 +1783,7 @@ class TestTool(ToolTestCase):
 
 def test_r6_deterministic_table_alignment_checker() -> None:
     """R6-3: Table alignment checker verifies pipe indices across header, separator, data rows."""
-    from helix_core.standalone_builder import check_table_alignment_output
+    from ogun_core.standalone_builder import check_table_alignment_output
 
     aligned_table = """
 | Col A | Col B      | Score |
@@ -1807,7 +1807,7 @@ def test_r6_deterministic_table_alignment_checker() -> None:
 
 def test_r6_strategy_transition_table() -> None:
     """R6-4: Explicit strategy transitions according to arbitration rules."""
-    from helix_core.quality import determine_fix_strategy
+    from ogun_core.quality import determine_fix_strategy
 
     assert determine_fix_strategy("HARNESS_ERROR", lock_tool=False, smoke_ok=False, smoke_has_harness_error=True) == "regenerate_tests_only"
     assert determine_fix_strategy("TEST", lock_tool=True, smoke_ok=True) == "regenerate_tests_only"
@@ -1846,7 +1846,7 @@ def test_r6_sentinel_lookup_distinguishes_null() -> None:
 
 def test_r7_zero_tests_ran_fails() -> None:
     """R7-1: Zero tests ran or count mismatch must never count as a pass."""
-    from helix_core.quality import parse_unittest_output, count_test_methods_ast
+    from ogun_core.quality import parse_unittest_output, count_test_methods_ast
 
     # 1. Zero tests ran
     zero_out = """----------------------------------------------------------------------
@@ -1877,7 +1877,7 @@ OK"""
 
 def test_r7_missing_main_guard_appends_and_runs() -> None:
     """R7-1: Test file lacking unittest.main() guard is detected and auto-appended deterministically."""
-    from helix_core.quality import has_unittest_main_guard, ensure_unittest_main_guard, run_direct_test_file
+    from ogun_core.quality import has_unittest_main_guard, ensure_unittest_main_guard, run_direct_test_file
 
     code_no_guard = """import unittest
 class TestSample(unittest.TestCase):
@@ -1903,7 +1903,7 @@ class TestSample(unittest.TestCase):
 
 def test_r7_colstats_exact_reproduction_not_passed() -> None:
     """R7-1: Exact reproduction of the Round 6 colstats failure must yield NOT PASSED."""
-    from helix_core.quality import compute_final_status_from_disk
+    from ogun_core.quality import compute_final_status_from_disk
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         td = Path(tmp_dir)
@@ -1973,7 +1973,7 @@ class TestColstats(unittest.TestCase):
 
 def test_r7_status_reconciliation_consistency_assertion() -> None:
     """R7-2: Builder cross-checks and assertion verifies no status string is produced inconsistent with facts."""
-    from helix_core.quality import assert_status_consistent_with_results
+    from ogun_core.quality import assert_status_consistent_with_results
 
     # Passing facts -> passes assertion
     valid_facts = {
@@ -2018,7 +2018,7 @@ def test_r7_status_reconciliation_consistency_assertion() -> None:
 
 def test_r7_oracle_csv_column_stats() -> None:
     """R7-3: Reference oracle detects float rejection and multi-column iterator exhaustion."""
-    from helix_core.quality import OracleRegistry
+    from ogun_core.quality import OracleRegistry
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         td = Path(tmp_dir)
@@ -2112,7 +2112,7 @@ if __name__ == '__main__': main()
 
 def test_r7_oracle_dotted_path_lookup() -> None:
     """R7-3: Reference oracle verifies dotted path lookup."""
-    from helix_core.quality import OracleRegistry
+    from ogun_core.quality import OracleRegistry
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         td = Path(tmp_dir)
@@ -2134,7 +2134,7 @@ if __name__ == '__main__': main()
 
 def test_r7_table_alignment_header_vs_data_width() -> None:
     """R7-3: Table alignment checker verifies header text vs data width after truncation."""
-    from helix_core.standalone_builder import check_table_alignment_output
+    from ogun_core.standalone_builder import check_table_alignment_output
 
     aligned_table = """
 | Col A | Col B      | Score |
@@ -2159,8 +2159,8 @@ def test_r7_table_alignment_header_vs_data_width() -> None:
 def test_r7_offline_regressions() -> None:
     """R7-4: Offline scripted regressions guarding Round 1 - Round 6 live scenarios."""
     import subprocess
-    from helix_core.quality import classify_tool_input_kind
-    from helix_core.standalone_builder import check_table_alignment_output
+    from ogun_core.quality import classify_tool_input_kind
+    from ogun_core.standalone_builder import check_table_alignment_output
 
     # R1/R2 guard: dupefinder unicode handling under cp1252 console
     env_cp1252 = {**dict(os.environ), "PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"}
@@ -2217,7 +2217,7 @@ def test_r8_test_file_hard_validator_numstats_reproduction() -> None:
     File has leaked '# FILE: test_numstats.py' header, duplicated ToolTestCase import block,
     markdown code fences, and undefined name references.
     """
-    from helix_core.quality import validate_generated_test_file
+    from ogun_core.quality import validate_generated_test_file
 
     malformed_test_code = """# FILE: test_numstats.py
 ```python
@@ -2257,7 +2257,7 @@ def test_r8_undefined_names_checker() -> None:
     """R8-2: Undefined names checker catches missing imports, variable typos,
     and comprehension scope leaks, while allowing builtins and conditional imports.
     """
-    from helix_core.quality import check_undefined_names_and_imports
+    from ogun_core.quality import check_undefined_names_and_imports
 
     # 1. Missing import sys
     code1 = """def main():
@@ -2300,7 +2300,7 @@ def test_r8_oracle_exercises_all_modes_and_catches_default_mode_crash() -> None:
     """R8-3: Oracle exercises every output mode, starting with default mode first,
     and catches tools that crash in default mode.
     """
-    from helix_core.quality import OracleRegistry
+    from ogun_core.quality import OracleRegistry
     with tempfile.TemporaryDirectory() as tmp_dir:
         td = Path(tmp_dir)
 
@@ -2342,7 +2342,7 @@ if __name__ == '__main__':
 
 def test_r8_linecount_oracle_word_line_char_counts() -> None:
     """R8-3: Linecount oracle checks lines, words, and characters across all modes."""
-    from helix_core.quality import OracleRegistry
+    from ogun_core.quality import OracleRegistry
     with tempfile.TemporaryDirectory() as tmp_dir:
         td = Path(tmp_dir)
 
@@ -2422,7 +2422,7 @@ def test_r8_arbitration_linecount_assertion_mismatches() -> None:
     """R8-4: Arbitration deterministically classifies assertion mismatches against valid output as TEST defects.
     Uses the exact 4 failing assertions from Round 7 linecount.
     """
-    from helix_core.quality import arbitrate_test_failure
+    from ogun_core.quality import arbitrate_test_failure
 
     test_src = """from _scaffold import ToolTestCase
 class TestLinecount(ToolTestCase):
@@ -2508,7 +2508,7 @@ class TestLinecount(ToolTestCase):
 # -----------------------------------------------------------------------------
 
 def test_r9_input_kind_inference_and_fixtures():
-    from helix_core.quality import infer_tool_input_kind, fixtures_for
+    from ogun_core.quality import infer_tool_input_kind, fixtures_for
 
     req_csv = "Build me a command-line tool called colsummary. Give it a CSV file with a header row and it prints stats."
     kind_csv = infer_tool_input_kind(req_csv, {}, "", "colsummary")
@@ -2533,7 +2533,7 @@ def test_r9_input_kind_inference_and_fixtures():
 
 
 def test_r9_mismatched_fixture_validator_rejection():
-    from helix_core.quality import validate_generated_test_file
+    from ogun_core.quality import validate_generated_test_file
 
     req_csv = "Build me a command-line tool called colsummary. Give it a CSV file with a header row. It needs a --json option."
     bad_test_json_fixture = """from _scaffold import ToolTestCase
@@ -2569,7 +2569,7 @@ if __name__ == '__main__':
 
 
 def test_r9_oracle_full_flag_combination_mode_matrix():
-    from helix_core.quality import OracleRegistry
+    from ogun_core.quality import OracleRegistry
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
 
@@ -2672,7 +2672,7 @@ else:
 
 
 def test_r9_spec_fidelity_ignoring_non_numeric_and_unrequested_options():
-    from helix_core.quality import check_unrequested_cli_options, OracleRegistry
+    from ogun_core.quality import check_unrequested_cli_options, OracleRegistry
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
 
@@ -2723,7 +2723,7 @@ p.add_argument('--foo-bar')
 
 
 def test_r9_table_row_column_consistency():
-    from helix_core.quality import check_table_row_column_consistency
+    from ogun_core.quality import check_table_row_column_consistency
 
     good_table = """
 Column | Count | Min | Max | Mean
@@ -2746,7 +2746,7 @@ col_b  | 2     | 3.0
 
 
 def test_r9_report_consistency_verifier():
-    from helix_core.quality import verify_report_consistency
+    from ogun_core.quality import verify_report_consistency
 
     contradictory_report = """# Round 9 Report
 | Flag | Result |
@@ -2780,7 +2780,7 @@ def test_r9_report_consistency_verifier():
 
 def test_r10_table_layout_alignment_gate():
     """R10-1: Deterministic table layout gate in every mode."""
-    from helix_core.quality import check_table_alignment_output
+    from ogun_core.quality import check_table_alignment_output
 
     # 1. Exact textsummary multi-file defect (6 separator segments for 4 columns, pipe index mismatch)
     broken_textsummary = """File   | Lines  | Words | Characters
@@ -2811,7 +2811,7 @@ b      | 3     | -20.5 | 30.0 | 6.666667"""
 
 def test_r10_row_order_semantics_totals_and_sorting():
     """R10-2: Row-order semantics: totals and sorting."""
-    from helix_core.quality import check_listing_row_order_and_totals
+    from ogun_core.quality import check_listing_row_order_and_totals
 
     # 1. Exact textsummary --sort Total-first defect (Total sorted together with files)
     total_first = """Total  | 3      | 7     | 28
@@ -2841,7 +2841,7 @@ Total  | 5      | 17    | 93"""
 
 def test_r10_observed_output_test_repair():
     """R10-3: Observed-output test repair when tool is proven right (57 vs 58, 99 vs 100, 11.666666666666666 vs 11.666667)."""
-    from helix_core.quality import repair_observed_output_test_defects
+    from ogun_core.quality import repair_observed_output_test_defects
 
     # Test code with real failing assertions from Round 9
     test_code = """import unittest
@@ -2937,7 +2937,7 @@ print("col_num | 10..20")
 
 def test_r10_report_consistency_verifier_evidence_backed():
     """R10-5: Report consistency check compares claims with pasted evidence."""
-    from helix_core.quality import verify_report_consistency
+    from ogun_core.quality import verify_report_consistency
 
     # Report claiming PASS for mode whose pasted output fails layout check (6 separator segments)
     contradictory_layout_report = """# Round 10 Report
@@ -2993,9 +2993,9 @@ def test_r11_observed_output_test_repair():
     """R11-1: Scripted fake reproducing exact wordtally assertions (99 vs 100, 88 vs 89, JSON 100 != 99).
     Must end with all assertions repaired and tests passing without regenerating the tool.
     """
-    from helix_core.quality import repair_observed_output_test_defects
-    from helix_core.standalone_builder import write_scaffold_file
-    from helix_core.codetools import run_python_test
+    from ogun_core.quality import repair_observed_output_test_defects
+    from ogun_core.standalone_builder import write_scaffold_file
+    from ogun_core.codetools import run_python_test
 
     test_code = """from _scaffold import ToolTestCase
 import unittest
@@ -3099,7 +3099,7 @@ def test_r11_use_before_assignment_checker():
     4. Globals/builtins (no flag)
     5. Nonlocal/global (no flag)
     """
-    from helix_core.quality import check_use_before_assignment
+    from ogun_core.quality import check_use_before_assignment
 
     # 1. Exact csvsummary print_table
     exact_csvsummary_code = """
@@ -3171,7 +3171,7 @@ def outer():
 
 def test_r11_selector_non_numeric_validation():
     """R11-3: Selector on a non-numeric column must exit non-zero, clear stderr, and NO traceback."""
-    from helix_core.quality import OracleRegistry
+    from ogun_core.quality import OracleRegistry
 
     with tempfile.TemporaryDirectory() as td:
         t_dir = Path(td)
@@ -3345,7 +3345,7 @@ if __name__ == "__main__":
 
 def test_r11_memory_streaming_gate():
     """R11-4: Memory streaming gate flags list-buffering implementations for streaming tasks."""
-    from helix_core.quality import check_streaming_memory_hygiene, check_tool_code_hygiene
+    from ogun_core.quality import check_streaming_memory_hygiene, check_tool_code_hygiene
 
     # List-buffering implementation (like csvsummary)
     list_buffering_code = """import csv, sys
@@ -3404,7 +3404,7 @@ R12_COLREPORT_REQ = (
 
 
 def test_r12_use_before_assignment_flow_cases() -> None:
-    from helix_core.quality import check_use_before_assignment as c
+    from ogun_core.quality import check_use_before_assignment as c
     must_flag = [
         "def p(stats, headers):\n    widths=[max(len(header), 1) for h in headers]\n    for header in headers:\n        pass\n",
         "def f(x):\n    if x:\n        y=1\n    return y\n",
@@ -3429,8 +3429,8 @@ def test_r12_use_before_assignment_flow_cases() -> None:
 
 def test_r12_status_leads_with_tool_defect() -> None:
     import tempfile, shutil
-    from helix_core.quality import compute_final_status_from_disk
-    from helix_core.standalone_builder import write_scaffold_file
+    from ogun_core.quality import compute_final_status_from_disk
+    from ogun_core.standalone_builder import write_scaffold_file
     d = Path(tempfile.mkdtemp())
     try:
         (d / "colreport.py").write_text((R12_FIX / "colreport_broken.py").read_text(encoding="utf-8"), encoding="utf-8")
@@ -3446,7 +3446,7 @@ def test_r12_status_leads_with_tool_defect() -> None:
 
 def test_r12_scripted_build_recovers_from_broken_colreport() -> None:
     import tempfile, shutil
-    from helix_core.standalone_builder import build_standalone_project_staged
+    from ogun_core.standalone_builder import build_standalone_project_staged
     broken = (R12_FIX / "colreport_broken.py").read_text(encoding="utf-8")
     good = (R12_FIX / "colreport_good.py").read_text(encoding="utf-8")
     tests = (R12_FIX / "test_colreport_good.py").read_text(encoding="utf-8")
@@ -3457,7 +3457,7 @@ def test_r12_scripted_build_recovers_from_broken_colreport() -> None:
     engine = CoreEngine(client=client)
     test_dir = tempfile.mkdtemp()
     try:
-        with patch("helix_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
+        with patch("ogun_core.standalone_builder.WORKSPACE_DIR", Path(test_dir)):
             success, msg, details = build_standalone_project_staged(engine, R12_COLREPORT_REQ, max_attempts=3)
         prompts = [m[0]["content"] for m in client.call_history]
         fix_prompts = [p for p in prompts if "FAILURES TO FIX" in p]
@@ -3472,7 +3472,7 @@ def test_r12_scripted_build_recovers_from_broken_colreport() -> None:
 
 def test_r12_text_tool_with_json_flag_gets_text_memory_fixture() -> None:
     import tempfile, shutil
-    import helix_core.quality as q
+    import ogun_core.quality as q
     seen = {}
     real_popen = q.subprocess.Popen
 
@@ -3500,7 +3500,7 @@ def test_r12_text_tool_with_json_flag_gets_text_memory_fixture() -> None:
 def test_r12h_argparse_text_in_tests_does_not_hide_tool_defects() -> None:
     """Round-11/12 colsheet: a test's argparse error made arbitration say HARNESS_ERROR although
     smoke/oracle had found real tool defects, so the tool was never regenerated."""
-    from helix_core.quality import arbitrate_test_failure
+    from ogun_core.quality import arbitrate_test_failure
     test_output = ("AssertionError: 'Error' not found in 'usage: colsheet.py [-h]\\n"
                    "colsheet.py: error: unrecognized arguments: --column x'")
     res = arbitrate_test_failure(request="Build me a command-line tool called colsheet with --json and --column NAME",
@@ -3518,8 +3518,8 @@ def test_r12h_argparse_text_in_tests_does_not_hide_tool_defects() -> None:
 def test_r12i_tool_prompt_contains_only_relevant_guidance() -> None:
     """Round-12 colsheet/colbrief: the tool prompt carried the agent persona (tool calls, write_file),
     JSON sentinel lookups, --max-width truncation and two-pass re-open streaming for a CSV-stats request."""
-    from helix_core.standalone_builder import build_tool_generation_prompt
-    from helix_core.quality import extract_requested_flags
+    from ogun_core.standalone_builder import build_tool_generation_prompt
+    from ogun_core.quality import extract_requested_flags
     p = build_tool_generation_prompt(R12_COLREPORT_REQ, "colreport", extract_requested_flags(R12_COLREPORT_REQ))
     for banned in ("write_file", "tool calls", "_MISSING", "--max-width", "Re-open or seek", "dupefinder"):
         assert banned not in p, f"irrelevant guidance in CSV prompt: {banned}"
@@ -3533,7 +3533,7 @@ def test_r12i_tool_prompt_contains_only_relevant_guidance() -> None:
 
 def test_r12j_concrete_target_example() -> None:
     import tempfile, shutil
-    from helix_core.quality import build_expected_output_example
+    from ogun_core.quality import build_expected_output_example
     d = Path(tempfile.mkdtemp())
     try:
         ex = build_expected_output_example(R12_COLREPORT_REQ, R12_FIX / "colreport_broken.py", d)
@@ -3548,7 +3548,7 @@ def test_r12j_concrete_target_example() -> None:
 
 def test_r12k_scaffold_splits_flag_value_argument() -> None:
     import subprocess, tempfile, shutil
-    from helix_core.standalone_builder import write_scaffold_file
+    from ogun_core.standalone_builder import write_scaffold_file
     d = Path(tempfile.mkdtemp())
     try:
         (d / "probe.py").write_text("import sys, json\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
@@ -3571,7 +3571,7 @@ def test_r12m_correct_csv_tool_gets_clean_smoke() -> None:
     """Round-12 colsight: the alignment smoke fixture was written with literal backslash-n, so a
     correct tool got a false 'Table alignment error' and PASSED WITH ISSUES."""
     import tempfile, shutil
-    from helix_core.standalone_builder import run_smoke_tests
+    from ogun_core.standalone_builder import run_smoke_tests
     d = Path(tempfile.mkdtemp())
     try:
         tool = d / "colreport.py"
@@ -3673,7 +3673,7 @@ def run_all_dev_fix_tests() -> bool:
     ]
 
     print("=" * 60)
-    print("  Helix Development-Ability Fixes Test Suite (F1 - F7)")
+    print("  Ogun Development-Ability Fixes Test Suite (F1 - F7)")
     print("=" * 60)
 
     passes = 0

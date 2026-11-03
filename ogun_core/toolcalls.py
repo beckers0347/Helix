@@ -1,4 +1,4 @@
-"""Helix pure text tool-call parser.
+"""Ogun pure text tool-call parser.
 
 Extracts structured tool calls from model text outputs:
 - Markdown fenced JSON blocks (non-greedy)

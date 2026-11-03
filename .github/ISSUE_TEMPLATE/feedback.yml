@@ -1,5 +1,5 @@
 name: Feedback or feature request
-description: Ideas, what you'd use Helix for, what's missing, what you'd pay for.
+description: Ideas, what you'd use Ogun for, what's missing, what you'd pay for.
 labels: [feedback]
 body:
   - type: textarea
@@ -11,4 +11,4 @@ body:
   - type: textarea
     id: usecase
     attributes:
-      label: What were you trying to do with Helix?
+      label: What were you trying to do with Ogun?

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helix - Training Data Pipeline for Direct Preference Optimization (DPO).
+"""Ogun - Training Data Pipeline for Direct Preference Optimization (DPO).
 
 Self-contained, stdlib-only pipeline that downloads, filters, normalizes,
 and packages open-source preference datasets for fine-tuning local Qwen-based coding models.
@@ -43,7 +43,7 @@ import urllib.request
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] [HELIX-DPO-DATA] %(message)s",
+    format="[%(asctime)s] [%(levelname)s] [OGUN-DPO-DATA] %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("prepare_training_data")
@@ -57,11 +57,11 @@ DEFAULT_MAX_PER_SOURCE = 20000
 DEFAULT_SYNTHETIC_CAP = 6000
 DEFAULT_EVAL_FRACTION = 0.01
 DEFAULT_SEED = 3407
-HELIX_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_PATH = HELIX_ROOT / "training" / "data" / "merged_dpo_dataset.jsonl"
-DEFAULT_CACHE_DIR = HELIX_ROOT / "training" / "data" / "raw"
+OGUN_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT_PATH = OGUN_ROOT / "training" / "data" / "merged_dpo_dataset.jsonl"
+DEFAULT_CACHE_DIR = OGUN_ROOT / "training" / "data" / "raw"
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Helix-DataPipeline/1.0"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Ogun-DataPipeline/1.0"
 
 
 # ==============================================================================
@@ -1436,7 +1436,7 @@ def run_pipeline(
 
     if not quiet:
         logger.info(
-            "Helix DPO Data Pipeline starting. Sources enabled: %s",
+            "Ogun DPO Data Pipeline starting. Sources enabled: %s",
             [s.short_name for s in selected_sources],
         )
 
@@ -1656,7 +1656,7 @@ def test_pipeline_output(path: Optional[Union[str, Path]] = None, n_samples: int
 
     # Print Verification Report
     print("=" * 70)
-    print("                 Helix DPO Dataset Verification")
+    print("                 Ogun DPO Dataset Verification")
     print(f"File: {path.resolve()}")
     print("=" * 70)
     print(f"Total Rows: {len(records)}")
@@ -1822,7 +1822,7 @@ def get_selftest_fixtures() -> Dict[str, List[Dict[str, Any]]]:
 def run_selftest() -> bool:
     """Execute end-to-end selftest on built-in fixtures in temporary directory."""
     print("=" * 70)
-    print("          Helix DPO Data Pipeline - Selftest")
+    print("          Ogun DPO Data Pipeline - Selftest")
     print("=" * 70)
     with tempfile.TemporaryDirectory() as td:
         temp_dir = Path(td)
@@ -1902,7 +1902,7 @@ def run_selftest() -> bool:
 
 def print_source_registry() -> None:
     print("=" * 70)
-    print("                 Helix DPO Source Registry")
+    print("                 Ogun DPO Source Registry")
     print("=" * 70)
     for s in SOURCE_REGISTRY:
         status = "ENABLED" if s.enabled_by_default else "DISABLED"
@@ -1915,7 +1915,7 @@ def print_source_registry() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Helix DPO Dataset Preparation Pipeline for Qwen Coder Fine-tuning.",
+        description="Ogun DPO Dataset Preparation Pipeline for Qwen Coder Fine-tuning.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--sources", type=str, default="", help="Comma-separated dataset ids or short names to run.")

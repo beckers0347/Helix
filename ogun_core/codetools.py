@@ -1,4 +1,4 @@
-"""Helix code-writing and file inspection tools.
+"""Ogun code-writing and file inspection tools.
 
 Provides safe file operations, exact-text edits, AST syntax checks,
 and subprocess unit-test runners guarded by PathSecurityGuard.
@@ -14,9 +14,9 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Union
 
-from helix_core.base_tool import ToolResult
-from helix_core.paths import HELIX_ROOT
-from helix_core.security import PathSecurityGuard
+from ogun_core.base_tool import ToolResult
+from ogun_core.paths import OGUN_ROOT
+from ogun_core.security import PathSecurityGuard
 
 _LINE_PREFIX_RE = re.compile(r"^\s*\d+\| ?")
 
@@ -41,7 +41,7 @@ def read_file(
     base_dir: Optional[Path] = None,
 ) -> str:
     """Read contents of a file, optionally bounded by line numbers (1-indexed)."""
-    root = (base_dir or HELIX_ROOT).resolve()
+    root = (base_dir or OGUN_ROOT).resolve()
     raw = str(filepath).strip().strip('"').strip("'")
     p = Path(raw)
     if not p.is_absolute():
@@ -160,7 +160,7 @@ def replace_in_file(
 
 def check_syntax(path_or_code: str, base_dir: Optional[Path] = None) -> str:
     """Verify Python syntax via ast.parse. Accepts a file path or raw code string."""
-    root = (base_dir or HELIX_ROOT).resolve()
+    root = (base_dir or OGUN_ROOT).resolve()
     code = path_or_code
     p = Path(path_or_code.strip().strip('"').strip("'"))
     if not p.is_absolute():
@@ -189,7 +189,7 @@ def run_python_test(
     base_dir: Optional[Path] = None,
 ) -> str:
     """Execute a Python test via module discovery and direct execution with summary verification."""
-    root = (base_dir or HELIX_ROOT).resolve()
+    root = (base_dir or OGUN_ROOT).resolve()
     raw = str(test_path).strip().strip('"').strip("'")
     p = Path(raw)
     if not p.is_absolute():
@@ -205,8 +205,8 @@ def run_python_test(
     env["PYTHONUTF8"] = "1"
     sep = ";" if sys.platform == "win32" else ":"
     paths = [str(root), str(p.parent)]
-    if str(HELIX_ROOT) != str(root):
-        paths.append(str(HELIX_ROOT))
+    if str(OGUN_ROOT) != str(root):
+        paths.append(str(OGUN_ROOT))
     existing_pp = env.get("PYTHONPATH")
     if existing_pp:
         paths.append(existing_pp)
@@ -223,7 +223,7 @@ def run_python_test(
     is_test_file = (p.name.startswith("test_") or p.name.endswith("_test.py")) and has_unittest
 
     if is_test_file:
-        from helix_core.quality import ensure_unittest_main_guard, run_and_parse_unittest, run_direct_test_file
+        from ogun_core.quality import ensure_unittest_main_guard, run_and_parse_unittest, run_direct_test_file
         ensure_unittest_main_guard(p)
 
         summary = run_and_parse_unittest(p.parent, p.stem, timeout=timeout)

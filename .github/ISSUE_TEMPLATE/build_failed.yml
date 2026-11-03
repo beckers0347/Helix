@@ -1,11 +1,11 @@
 name: Tool or plugin build failed
-description: You asked Helix to build a tool or plugin and it failed or produced wrong output.
+description: You asked Ogun to build a tool or plugin and it failed or produced wrong output.
 labels: [builder]
 body:
   - type: textarea
     id: request
     attributes:
-      label: Exact request you gave Helix
+      label: Exact request you gave Ogun
       render: text
     validations:
       required: true
@@ -13,7 +13,7 @@ body:
     id: result
     attributes:
       label: What went wrong?
-      description: The final status Helix printed, and what the tool did wrong (if it was built).
+      description: The final status Ogun printed, and what the tool did wrong (if it was built).
     validations:
       required: true
   - type: textarea
@@ -33,5 +33,5 @@ body:
     id: hardware
     attributes:
       label: Your setup
-      description: Output of `run_helix.bat --hardware-info`.
+      description: Output of `run_ogun.bat --hardware-info`.
       render: text

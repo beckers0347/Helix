@@ -1,4 +1,4 @@
-"""Helix standalone autonomous coding assistant CLI entrypoint."""
+"""Ogun standalone autonomous coding assistant CLI entrypoint."""
 from __future__ import annotations
 
 import argparse
@@ -7,13 +7,13 @@ import os
 import re
 import sys
 
-from helix_core import autotune
-from helix_core.config import MODEL_NAME, OLLAMA_HOST, PLUGIN_BUILDER_PROMPT
-from helix_core.config import set_vram_profile
-from helix_core.engine import CoreEngine, OllamaClient, handle_vram_command, unload_model
-from helix_core.paths import init_user_workspace
-from helix_core.plugin_builder import build_plugin_staged, parse_code_blocks
-from helix_core.plugin_manager import PluginManager
+from ogun_core import autotune
+from ogun_core.config import MODEL_NAME, OLLAMA_HOST, PLUGIN_BUILDER_PROMPT
+from ogun_core.config import set_vram_profile
+from ogun_core.engine import CoreEngine, OllamaClient, handle_vram_command, unload_model
+from ogun_core.paths import init_user_workspace
+from ogun_core.plugin_builder import build_plugin_staged, parse_code_blocks
+from ogun_core.plugin_manager import PluginManager
 
 
 UNLOAD_PHRASES = {
@@ -28,7 +28,7 @@ def is_unload_command(text: str) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Helix Autonomous Coding Assistant")
+    parser = argparse.ArgumentParser(description="Ogun Autonomous Coding Assistant")
     parser.add_argument("--once", type=str, help="Execute a single turn and exit.")
     parser.add_argument("--build-plugin", type=str, help="Prompt the model to build, verify, and mount a plugin.")
     parser.add_argument("--model", type=str, default=None, help=f"Ollama model to use (default: {MODEL_NAME}).")
@@ -71,8 +71,8 @@ def main() -> None:
         print(f"[ERROR] {conn_msg}", file=sys.stderr)
         sys.exit(1)
 
-    # Free the GPU when Helix exits (normal exit, Ctrl+C, --once, --build-plugin). Opt out: HELIX_UNLOAD_ON_EXIT=0.
-    if os.environ.get("HELIX_UNLOAD_ON_EXIT", "1") != "0":
+    # Free the GPU when Ogun exits (normal exit, Ctrl+C, --once, --build-plugin). Opt out: OGUN_UNLOAD_ON_EXIT=0.
+    if os.environ.get("OGUN_UNLOAD_ON_EXIT", "1") != "0":
         _unloaded = {"done": False}
 
         def _unload_on_exit() -> None:
@@ -116,14 +116,14 @@ def main() -> None:
 
     # 3. Interactive CLI loop
     print("=" * 60)
-    print(f"  Helix Autonomous Coding Assistant (Model: {args.model})")
+    print(f"  Ogun Autonomous Coding Assistant (Model: {args.model})")
     print("  Type 'exit' or 'quit' to close. Press Ctrl+C to cancel a turn.")
     print("  GPU memory: /vram auto | /vram shared | /vram max | /vram cpu | /vram free | /vram status")
     print("=" * 60)
 
     while True:
         try:
-            user_input = input("\nHelix > ").strip()
+            user_input = input("\nOgun > ").strip()
             if not user_input:
                 continue
             if user_input.lower() in ("exit", "quit"):

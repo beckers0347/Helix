@@ -13,7 +13,7 @@ if not exist "!DATASET_FILE!" (
 
 REM 2. Hardware advisory
 echo ======================================================================
-echo  Helix Unsloth DPO Fine-Tuning Launcher
+echo  Ogun Unsloth DPO Fine-Tuning Launcher
 echo ======================================================================
 echo [ADVISORY] Training requires >= 11 GB free VRAM on NVIDIA RTX 5070 (12 GB).
 echo Please close Ollama, Blender, Unreal Engine, and browser hardware acceleration
@@ -57,7 +57,7 @@ set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONPATH=%~dp0;%~dp0\training"
 
-".venv-train\Scripts\python.exe" training\helix_unsloth_trainer.py %*
+".venv-train\Scripts\python.exe" training\ogun_unsloth_trainer.py %*
 set "EXITCODE=%errorlevel%"
 
 exit /b %EXITCODE%

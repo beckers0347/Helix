@@ -1,1 +1,1 @@
-"""Helix Dynamic Plugins Package."""
+"""Ogun Dynamic Plugins Package."""

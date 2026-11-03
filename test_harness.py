@@ -1,4 +1,4 @@
-"""Helix automated end-to-end test harness for plugin builder.
+"""Ogun automated end-to-end test harness for plugin builder.
 
 Prompts local Ollama (qwen2.5-coder:14b) to build StringHasherTool, runs isolated
 subprocess unit tests, hot-loads the plugin, and performs independent verification
@@ -15,10 +15,10 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from helix_core.config import MODEL_NAME, PLUGIN_BUILDER_PROMPT
-from helix_core.engine import OllamaClient
-from helix_core.paths import HELIX_ROOT, init_user_workspace
-from helix_core.plugin_manager import PluginManager
+from ogun_core.config import MODEL_NAME, PLUGIN_BUILDER_PROMPT
+from ogun_core.engine import OllamaClient
+from ogun_core.paths import OGUN_ROOT, init_user_workspace
+from ogun_core.plugin_manager import PluginManager
 
 
 def extract_python_blocks(text: str) -> List[str]:
@@ -29,7 +29,7 @@ def extract_python_blocks(text: str) -> List[str]:
 
 def run_harness(model: str = MODEL_NAME, keep: bool = False) -> bool:
     print("=" * 60)
-    print(f"  Helix Dynamic Plugin Builder Test Harness")
+    print(f"  Ogun Dynamic Plugin Builder Test Harness")
     print(f"  Target Model: {model}")
     print("=" * 60)
 
@@ -40,11 +40,11 @@ def run_harness(model: str = MODEL_NAME, keep: bool = False) -> bool:
         return False
 
     init_user_workspace()
-    plugin_manager = PluginManager(base_dir=HELIX_ROOT)
+    plugin_manager = PluginManager(base_dir=OGUN_ROOT)
 
     tool_name = "string_hasher_tool"
-    tool_file = HELIX_ROOT / "plugins" / "custom_tools" / f"{tool_name}.py"
-    test_file = HELIX_ROOT / "plugins" / "tests" / f"test_{tool_name}.py"
+    tool_file = OGUN_ROOT / "plugins" / "custom_tools" / f"{tool_name}.py"
+    test_file = OGUN_ROOT / "plugins" / "tests" / f"test_{tool_name}.py"
 
     prompt = (
         f"{PLUGIN_BUILDER_PROMPT}\n\n"
@@ -56,7 +56,7 @@ def run_harness(model: str = MODEL_NAME, keep: bool = False) -> bool:
     )
 
     messages = [
-        {"role": "system", "content": "You are Helix, an autonomous coding engine specializing in writing dynamic plugins."},
+        {"role": "system", "content": "You are Ogun, an autonomous coding engine specializing in writing dynamic plugins."},
         {"role": "user", "content": prompt},
     ]
 
@@ -132,8 +132,8 @@ def run_harness(model: str = MODEL_NAME, keep: bool = False) -> bool:
         ("Empty string", "", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
         (
             "Non-ASCII Unicode",
-            "Helix Coder こんにちは世界 ⚡",
-            hashlib.sha256("Helix Coder こんにちは世界 ⚡".encode("utf-8")).hexdigest(),
+            "Ogun Coder こんにちは世界 ⚡",
+            hashlib.sha256("Ogun Coder こんにちは世界 ⚡".encode("utf-8")).hexdigest(),
         ),
     ]
 
@@ -162,7 +162,7 @@ def run_harness(model: str = MODEL_NAME, keep: bool = False) -> bool:
             if test_file.exists():
                 test_file.unlink()
             # Reset registry
-            reg_file = HELIX_ROOT / "plugins" / "registry.json"
+            reg_file = OGUN_ROOT / "plugins" / "registry.json"
             reg_file.write_bytes(b"{}\n")
             print("[+] Plugins directory and registry.json successfully reset.")
         except Exception as exc:
@@ -180,7 +180,7 @@ def run_harness(model: str = MODEL_NAME, keep: bool = False) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Helix Plugin Builder Test Harness")
+    parser = argparse.ArgumentParser(description="Ogun Plugin Builder Test Harness")
     parser.add_argument("--model", type=str, default=MODEL_NAME, help="Model name")
     parser.add_argument("--keep", action="store_true", help="Keep generated plugin files")
     args = parser.parse_args()

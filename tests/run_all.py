@@ -1,7 +1,7 @@
-"""Master offline test runner for Helix.
+"""Master offline test runner for Ogun.
 
-Executes all Helix offline test suites:
-- test_helix_core.py
+Executes all Ogun offline test suites:
+- test_ogun_core.py
 - test_training_data.py
 - test_training_trainer.py
 
@@ -44,15 +44,15 @@ def run_suite(name: str, script_path: Path) -> tuple[bool, str]:
 def main() -> int:
     tests_dir = Path(__file__).resolve().parent
     suites = [
-        ("Helix Core Test Suite", tests_dir / "test_helix_core.py"),
-        ("Helix Training Data Pipeline Suite", tests_dir / "test_training_data.py"),
-        ("Helix Unsloth Trainer Suite", tests_dir / "test_training_trainer.py"),
-        ("Helix Hardware Auto-Tune Suite", tests_dir / "test_hardware.py"),
-        ("Helix Dev-Ability Fixes Suite", tests_dir / "test_dev_fixes.py"),
+        ("Ogun Core Test Suite", tests_dir / "test_ogun_core.py"),
+        ("Ogun Training Data Pipeline Suite", tests_dir / "test_training_data.py"),
+        ("Ogun Unsloth Trainer Suite", tests_dir / "test_training_trainer.py"),
+        ("Ogun Hardware Auto-Tune Suite", tests_dir / "test_hardware.py"),
+        ("Ogun Dev-Ability Fixes Suite", tests_dir / "test_dev_fixes.py"),
     ]
 
     print("=" * 70)
-    print("                  HELIX MASTER TEST RUNNER")
+    print("                  OGUN MASTER TEST RUNNER")
     print("=" * 70)
 
     all_passed = True
@@ -84,7 +84,7 @@ def main() -> int:
                 print(out)
         return 1
 
-    print("\nAll Helix offline test suites passed successfully.")
+    print("\nAll Ogun offline test suites passed successfully.")
     return 0
 
 

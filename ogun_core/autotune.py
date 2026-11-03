@@ -1,7 +1,7 @@
-"""Startup hardware auto-tuning for Helix: probe this machine, size the inference runtime to it, and report.
+"""Startup hardware auto-tuning for Ogun: probe this machine, size the inference runtime to it, and report.
 
 Kept out of main.py so the CLI stays small and the whole flow is testable. Nothing here runs at import time.
-Every failure degrades to Helix's static defaults (the original behaviour); auto-tuning never stops Helix from starting.
+Every failure degrades to Ogun's static defaults (the original behaviour); auto-tuning never stops Ogun from starting.
 """
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import json
 import os
 from typing import Any, Dict, Optional
 
-from helix_core import hardware
-from helix_core.config import apply_hardware_profile, get_vram_profile
-from helix_core.paths import HELIX_ROOT
+from ogun_core import hardware
+from ogun_core.config import apply_hardware_profile, get_vram_profile
+from ogun_core.paths import OGUN_ROOT
 
-PROFILE_PATH = HELIX_ROOT / "config" / "hardware_profile.json"
+PROFILE_PATH = OGUN_ROOT / "config" / "hardware_profile.json"
 
 
 def add_arguments(parser) -> None:
@@ -27,8 +27,8 @@ def add_arguments(parser) -> None:
     g.add_argument("--ctx", type=int, default=None, metavar="TOKENS", help="Force the context window (4096-16384 is the tuned range).")
     g.add_argument("--threads", type=int, default=None, metavar="N", help="Force the CPU thread count.")
     g.add_argument("--save-overrides", action="store_true", help="Remember the flags above for later runs on this machine.")
-    g.add_argument("--no-hardware-probe", action="store_true", help="Skip auto-tuning and use Helix's static defaults.")
-    g.add_argument("--hardware-info", action="store_true", help="Print the detected hardware and the settings Helix would use, then exit.")
+    g.add_argument("--no-hardware-probe", action="store_true", help="Skip auto-tuning and use Ogun's static defaults.")
+    g.add_argument("--hardware-info", action="store_true", help="Print the detected hardware and the settings Ogun would use, then exit.")
     g.add_argument("--json", action="store_true", help="With --hardware-info: machine-readable output.")
 
 
@@ -55,7 +55,7 @@ def cli_overrides(args) -> Dict[str, Any]:
 
 def user_chose_gpu_split() -> bool:
     """True when the user already picked a GPU split through the environment: auto-tuning must not override that."""
-    return bool(os.environ.get("HELIX_VRAM_PROFILE") or os.environ.get("HELIX_NUM_GPU"))
+    return bool(os.environ.get("OGUN_VRAM_PROFILE") or os.environ.get("OGUN_NUM_GPU"))
 
 
 def _detect(host: str, model: str):
@@ -93,7 +93,7 @@ def boot(args, model: str, host: str) -> Optional[Dict[str, Any]]:
         return None
     if getattr(args, "vram", None) or user_chose_gpu_split():
         print(f"[*] GPU split chosen explicitly ({get_vram_profile()}); hardware auto-tuning skipped. "
-              "Run with --auto-tune and without --vram / HELIX_VRAM_PROFILE / HELIX_NUM_GPU to let Helix choose.")
+              "Run with --auto-tune and without --vram / OGUN_VRAM_PROFILE / OGUN_NUM_GPU to let Ogun choose.")
         return None
     try:
         hw, oll = _detect(host, model)
@@ -113,6 +113,6 @@ def boot(args, model: str, host: str) -> Optional[Dict[str, Any]]:
         hardware.save_profile(PROFILE_PATH, hw, profile, overrides=merged if args.save_overrides else saved_overrides)
         print(hardware.format_banner(hw, profile, profile_path=str(PROFILE_PATH)))
         return applied
-    except Exception as exc:  # auto-tuning must never stop Helix from starting
+    except Exception as exc:  # auto-tuning must never stop Ogun from starting
         print(f"[Hardware Warning] Auto-tuning fell back to the default configuration: {exc}")
         return None

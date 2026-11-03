@@ -1,4 +1,4 @@
-"""Helix configuration and prompt definitions.
+"""Ogun configuration and prompt definitions.
 
 Model options, generation hyperparameters, and system prompt templates.
 """
@@ -8,7 +8,7 @@ import os
 import sys
 
 # Model and host configuration
-MODEL_NAME = os.environ.get("HELIX_MODEL", "qwen2.5-coder:14b")
+MODEL_NAME = os.environ.get("OGUN_MODEL", "qwen2.5-coder:14b")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 
 # Ollama generation hyperparameters (optimized for Qwen2.5-Coder)
@@ -17,7 +17,7 @@ TOP_P = 0.95
 NUM_CTX = 8192
 NUM_PREDICT = 3072
 STOP_TOKENS = ["<|im_end|>"]
-KEEP_ALIVE = os.environ.get("HELIX_KEEP_ALIVE", "2m")   # idle models must not hold GPU memory for long
+KEEP_ALIVE = os.environ.get("OGUN_KEEP_ALIVE", "2m")   # idle models must not hold GPU memory for long
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Hardware allocation profiles: how many of the model's layers run on the GPU (Ollama option `num_gpu`).
@@ -50,7 +50,7 @@ def resolve_vram_profile(name):
 
 
 def _parse_num_gpu(raw, default=24):
-    """HELIX_NUM_GPU: a custom layer count. 'auto'/'all'/'-1' -> None (omit the option). Invalid -> default, with a warning."""
+    """OGUN_NUM_GPU: a custom layer count. 'auto'/'all'/'-1' -> None (omit the option). Invalid -> default, with a warning."""
     if raw is None or str(raw).strip() == "":
         return default
     text = str(raw).strip().lower()
@@ -62,7 +62,7 @@ def _parse_num_gpu(raw, default=24):
             return value
     except ValueError:
         pass
-    print(f"[Helix] ignoring invalid HELIX_NUM_GPU={raw!r}; using {default}.", file=sys.stderr)
+    print(f"[Ogun] ignoring invalid OGUN_NUM_GPU={raw!r}; using {default}.", file=sys.stderr)
     return default
 
 
@@ -71,16 +71,16 @@ _ACTIVE = {"profile": DEFAULT_VRAM_PROFILE, "num_gpu": VRAM_PROFILES[DEFAULT_VRA
 
 
 def _init_vram_state():
-    """Initial profile: HELIX_NUM_GPU (custom count / 'auto') wins, then HELIX_VRAM_PROFILE, then SHARED_VRAM."""
-    custom = os.environ.get("HELIX_NUM_GPU")
+    """Initial profile: OGUN_NUM_GPU (custom count / 'auto') wins, then OGUN_VRAM_PROFILE, then SHARED_VRAM."""
+    custom = os.environ.get("OGUN_NUM_GPU")
     if custom is not None and custom.strip() != "":
         value = _parse_num_gpu(custom)
         _ACTIVE.update(profile="AUTO" if value is None else f"CUSTOM({value})", num_gpu=value)
         return
-    wanted = os.environ.get("HELIX_VRAM_PROFILE")
+    wanted = os.environ.get("OGUN_VRAM_PROFILE")
     key = resolve_vram_profile(wanted) if wanted else DEFAULT_VRAM_PROFILE
     if wanted and key is None:
-        print(f"[Helix] ignoring invalid HELIX_VRAM_PROFILE={wanted!r}; using {DEFAULT_VRAM_PROFILE}.", file=sys.stderr)
+        print(f"[Ogun] ignoring invalid OGUN_VRAM_PROFILE={wanted!r}; using {DEFAULT_VRAM_PROFILE}.", file=sys.stderr)
         key = DEFAULT_VRAM_PROFILE
     _ACTIVE.update(profile=key, num_gpu=VRAM_PROFILES[key]["num_gpu"])
 
@@ -119,7 +119,7 @@ def get_num_thread():
 
 
 def get_hardware_profile():
-    """The applied hardware profile dict (see helix_core.hardware.profile_to_dict) or None."""
+    """The applied hardware profile dict (see ogun_core.hardware.profile_to_dict) or None."""
     return _ACTIVE["hardware"]
 
 
@@ -175,7 +175,7 @@ def get_request_timeout() -> float:
     slower token generation without premature aborts.
     Read at CALL TIME: never copy into a module constant.
     """
-    env_override = os.environ.get("HELIX_REQUEST_TIMEOUT")
+    env_override = os.environ.get("OGUN_REQUEST_TIMEOUT")
     if env_override:
         try:
             val = float(env_override)
@@ -204,7 +204,7 @@ def get_request_timeout() -> float:
 REQUEST_TIMEOUT = 300.0
 
 # System instructions
-SYSTEM_PROMPT = """You are Helix, an autonomous technical coding engine and developer assistant.
+SYSTEM_PROMPT = """You are Ogun, an autonomous technical coding engine and developer assistant.
 You specialize in writing clean, reliable, and production-ready Python code, inspecting directories,
 diagnosing bugs, and authoring standalone projects and dynamic plugins.
 When tool calling is required, output either native tool calls or fenced JSON tool calls.
@@ -214,11 +214,11 @@ Always ensure your code is syntactically valid and completely avoids placeholder
 - Standalone CLI utilities / projects (e.g. dupefinder, scripts, tools):
   Save files under `workspace/<project_name>/` (e.g. `workspace/dupefinder/dupefinder.py` and `workspace/dupefinder/test_dupefinder.py`) using `write_file`.
   Run tests using `run_python_test` with the test file path.
-- Helix Dynamic Plugins:
-  Use `create_plugin` (inheriting from BaseTool) ONLY when the user explicitly asks for a Helix plugin or dynamic tool.
+- Ogun Dynamic Plugins:
+  Use `create_plugin` (inheriting from BaseTool) ONLY when the user explicitly asks for an Ogun plugin or dynamic tool.
 - Security Boundaries:
   Writes are strictly confined to `workspace/`, `plugins/custom_tools/`, and `plugins/tests/`.
-  Modifying `helix_core/`, `training/`, or engine files is strictly forbidden.
+  Modifying `ogun_core/`, `training/`, or engine files is strictly forbidden.
 
 ### Software Quality & Implementation Checklist:
 - Requirements Completeness: Re-check all requested CLI flags (e.g. `--json`, `--min-size`), positional arguments, and calculations (e.g. wasted disk space). Every requested item must be fully implemented and covered by unit tests.
@@ -232,13 +232,13 @@ Always ensure your code is syntactically valid and completely avoids placeholder
 - Truthful Execution: Never claim files were saved or tests passed unless you executed the real tool calls (`write_file`, `run_python_test`) and they succeeded.
 """
 
-PLUGIN_BUILDER_PROMPT = """You are an expert Python engineer authoring a dynamic plugin for Helix.
+PLUGIN_BUILDER_PROMPT = """You are an expert Python engineer authoring a dynamic plugin for Ogun.
 Your response MUST contain EXACTLY TWO fenced ```python code blocks in this order:
 1. The tool implementation block.
 2. The unit test block.
 
 ### Quality & Operational Requirements:
-- The tool MUST inherit from `helix_core.base_tool.BaseTool`.
+- The tool MUST inherit from `ogun_core.base_tool.BaseTool`.
 - Define `name` (string, snake_case), `version` (string, e.g. "1.0.0"), `description` (string), and `parameters_schema` (JSON Schema dictionary).
 - Implement `execute(self, **kwargs: Any) -> ToolResult`.
 - Return `ToolResult.success(output=...)` on success, or `ToolResult.error(error_trace=...)` on failure.
@@ -250,7 +250,7 @@ Your response MUST contain EXACTLY TWO fenced ```python code blocks in this orde
 
 ### Unit Test Requirements:
 - Standalone runnable via `python plugins/tests/test_<name>.py` (no pytest required).
-- Add the Helix root to `sys.path` using `Path(__file__).resolve().parents[2]`.
+- Add the Ogun root to `sys.path` using `Path(__file__).resolve().parents[2]`.
 - Verify execution on typical inputs, empty strings (if applicable), and edge cases.
 - Print "PASS" and exit with code 0 on success, or print error to stderr and exit with non-zero code on failure.
 
@@ -259,7 +259,7 @@ Your response MUST contain EXACTLY TWO fenced ```python code blocks in this orde
 ```python
 from __future__ import annotations
 from typing import Any, Dict
-from helix_core.base_tool import BaseTool, ToolResult
+from ogun_core.base_tool import BaseTool, ToolResult
 
 class SampleTool(BaseTool):
     name: str = "sample_tool"
@@ -293,10 +293,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Add Helix root to sys.path
-HELIX_ROOT = Path(__file__).resolve().parents[2]
-if str(HELIX_ROOT) not in sys.path:
-    sys.path.insert(0, str(HELIX_ROOT))
+# Add Ogun root to sys.path
+OGUN_ROOT = Path(__file__).resolve().parents[2]
+if str(OGUN_ROOT) not in sys.path:
+    sys.path.insert(0, str(OGUN_ROOT))
 
 from plugins.custom_tools.sample_tool import SampleTool
 

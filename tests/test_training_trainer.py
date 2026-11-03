@@ -1,4 +1,4 @@
-"""Unit and integration tests for Helix Unsloth Trainer (helix_unsloth_trainer.py).
+"""Unit and integration tests for Ogun Unsloth Trainer (ogun_unsloth_trainer.py).
 
 Runs completely offline: zero GPU access, zero model weight downloads, zero pytest dependencies.
 All tests run via standard assertions under the plain test runner.
@@ -20,14 +20,14 @@ import types
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
-# Ensure Helix root and training are on sys.path
-HELIX_ROOT = Path(__file__).resolve().parents[1]
-if str(HELIX_ROOT / "training") not in sys.path:
-    sys.path.insert(0, str(HELIX_ROOT / "training"))
-if str(HELIX_ROOT) not in sys.path:
-    sys.path.insert(0, str(HELIX_ROOT))
+# Ensure Ogun root and training are on sys.path
+OGUN_ROOT = Path(__file__).resolve().parents[1]
+if str(OGUN_ROOT / "training") not in sys.path:
+    sys.path.insert(0, str(OGUN_ROOT / "training"))
+if str(OGUN_ROOT) not in sys.path:
+    sys.path.insert(0, str(OGUN_ROOT))
 
-import helix_unsloth_trainer as trainer
+import ogun_unsloth_trainer as trainer
 
 
 # ==============================================================================
@@ -65,7 +65,7 @@ SAMPLE_TOOL_SCHEMA = [
 
 SAMPLE_CONVERSATION = {
     "messages": [
-        {"role": "system", "content": "You are Helix, an AI coding assistant."},
+        {"role": "system", "content": "You are Ogun, an AI coding assistant."},
         {"role": "user", "content": "Write quicksort in python."},
         {
             "role": "assistant",
@@ -629,7 +629,7 @@ def run_all_tests() -> bool:
     ]
 
     print("=" * 60)
-    print("  Helix Unsloth Trainer Offline Test Suite")
+    print("  Ogun Unsloth Trainer Offline Test Suite")
     print("=" * 60)
 
     passes = 0

@@ -16,7 +16,7 @@ if exist ".venv\Scripts\python.exe" (
     )
 )
 
-echo [*] Running Helix DPO Dataset Preparation Pipeline...
+echo [*] Running Ogun DPO Dataset Preparation Pipeline...
 %PY_EXE% training\prepare_training_data.py %*
 set "EXITCODE=%errorlevel%"
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helix Unsloth Direct Preference Optimization (DPO) Trainer.
+"""Ogun Unsloth Direct Preference Optimization (DPO) Trainer.
 
 Fine-tunes Qwen2.5-Coder models using 4-bit LoRA and DPO on pre-compiled datasets.
 Designed for Windows 10/11 with NVIDIA RTX 5070 (12GB VRAM).
@@ -28,15 +28,15 @@ from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Set
 # Logging setup
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] [HELIX-DPO-TRAIN] %(message)s",
+    format="[%(asctime)s] [%(levelname)s] [OGUN-DPO-TRAIN] %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("helix_unsloth_trainer")
+logger = logging.getLogger("ogun_unsloth_trainer")
 
 # Path resolvers
-HELIX_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATASET_FILE = HELIX_ROOT / "training" / "data" / "merged_dpo_dataset.jsonl"
-DEFAULT_OUTPUT_DIR = HELIX_ROOT / "training" / "data" / "exports"
+OGUN_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATASET_FILE = OGUN_ROOT / "training" / "data" / "merged_dpo_dataset.jsonl"
+DEFAULT_OUTPUT_DIR = OGUN_ROOT / "training" / "data" / "exports"
 
 # Model constants
 MODEL_SIZE_MAP = {
@@ -688,8 +688,8 @@ Follow these steps to manually convert, quantize, and serve with llama.cpp:
 3. Serve via llama-server on port 8080:
    llama-server.exe -m "{q4_gguf}" -c 8192 -ngl 99 --jinja --host 127.0.0.1 --port 8080
 
-4. Point Helix at the quantized model in Ollama:
-   ollama create helix-coder -f "{output_dir}\\Modelfile"
+4. Point Ogun at the quantized model in Ollama:
+   ollama create ogun-coder -f "{output_dir}\\Modelfile"
 ================================================================================
 """
     print(instructions)
@@ -760,7 +760,7 @@ def export_model(
 def run_dry_run(args: argparse.Namespace) -> int:
     """Validate dataset file, display sample pairs, token stats, and preflight verdicts without GPU."""
     logger.info("=" * 70)
-    logger.info("STARTING HELIX DRY RUN (Validation & Schema Check)")
+    logger.info("STARTING OGUN DRY RUN (Validation & Schema Check)")
     logger.info("Dataset File: %s", args.dataset_file)
     logger.info("Model: %s | Variant: %s", MODEL_SIZE_MAP.get(args.model_size), args.model_size.upper())
     logger.info("=" * 70)
@@ -839,7 +839,7 @@ def run_dry_run(args: argparse.Namespace) -> int:
     print(f"[Hardware Pre-Flight: Disk] {'PASS' if disk_ok else 'FAIL'}: {disk_msg}")
 
     # Planned output paths
-    run_name = args.run_name or f"helix-qwen2.5-coder-{args.model_size}-dpo"
+    run_name = args.run_name or f"ogun-qwen2.5-coder-{args.model_size}-dpo"
     export_path = args.output_dir / run_name
     print(f"\n[Planned Output Paths]")
     print(f"  - LoRA Adapter Output: {export_path / 'adapter'}")
@@ -855,7 +855,7 @@ def run_dry_run(args: argparse.Namespace) -> int:
 # ==============================================================================
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Helix Unsloth DPO Fine-Tuning Pipeline")
+    parser = argparse.ArgumentParser(description="Ogun Unsloth DPO Fine-Tuning Pipeline")
     parser.add_argument(
         "--dataset-file",
         type=Path,
@@ -883,7 +883,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--run-name",
         type=str,
-        default="helix-qwen2.5-coder-14b-dpo",
+        default="ogun-qwen2.5-coder-14b-dpo",
         help="Subdirectory run name under output-dir.",
     )
     parser.add_argument(

@@ -20,8 +20,8 @@ from unittest.mock import patch, MagicMock
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-from helix_core import hardware
-from helix_core.hardware import (
+from ogun_core import hardware
+from ogun_core.hardware import (
     GpuInfo,
     HardwareInfo,
     ModelSpec,
@@ -142,7 +142,7 @@ def test_hardware_probing_scenarios():
             "VRAM Total Used Memory (B)": str(2 * 1024**3),
         }
     })
-    with patch("helix_core.hardware._run_subproc", return_value=(0, rocm_json)):
+    with patch("ogun_core.hardware._run_subproc", return_value=(0, rocm_json)):
         gpus_amd = hardware._probe_amd_gpus("linux", 2.0, [])
         assert len(gpus_amd) == 1
         assert gpus_amd[0].vendor == "amd"
@@ -170,30 +170,30 @@ def test_hardware_probing_scenarios():
     assert hw_cpu64.gpu is None
 
     # 12. nvidia-smi missing, timing out, or garbage
-    with patch("helix_core.hardware._find_nvidia_smi", return_value=None):
+    with patch("ogun_core.hardware._find_nvidia_smi", return_value=None):
         notes = []
         g_none = hardware._probe_nvidia_gpus(2.0, notes)
         assert len(g_none) == 0
 
-    with patch("helix_core.hardware._find_nvidia_smi", return_value="nvidia-smi"):
-        with patch("helix_core.hardware._run_subproc", return_value=(-1, "timeout")):
+    with patch("ogun_core.hardware._find_nvidia_smi", return_value="nvidia-smi"):
+        with patch("ogun_core.hardware._run_subproc", return_value=(-1, "timeout")):
             notes = []
             g_timeout = hardware._probe_nvidia_gpus(2.0, notes)
             assert len(g_timeout) == 0
             assert any("failed" in n for n in notes)
 
-        with patch("helix_core.hardware._run_subproc", return_value=(0, "not,a,valid,csv,output\nsecond,line,corrupt")):
+        with patch("ogun_core.hardware._run_subproc", return_value=(0, "not,a,valid,csv,output\nsecond,line,corrupt")):
             notes = []
             g_garbage = hardware._probe_nvidia_gpus(2.0, notes)
             assert len(g_garbage) == 0
             assert len(notes) > 0
 
     # 13. Probe where every internal call raises (must return CPU-only HardwareInfo without raising)
-    with patch("helix_core.hardware._probe_nvidia_gpus", side_effect=RuntimeError("GPU probe failed")), \
-         patch("helix_core.hardware._probe_amd_gpus", side_effect=RuntimeError("AMD probe failed")), \
-         patch("helix_core.hardware._probe_intel_gpus", side_effect=RuntimeError("Intel probe failed")), \
-         patch("helix_core.hardware._probe_ram", side_effect=RuntimeError("RAM probe failed")), \
-         patch("helix_core.hardware._probe_cpu_cores", side_effect=RuntimeError("Core probe failed")):
+    with patch("ogun_core.hardware._probe_nvidia_gpus", side_effect=RuntimeError("GPU probe failed")), \
+         patch("ogun_core.hardware._probe_amd_gpus", side_effect=RuntimeError("AMD probe failed")), \
+         patch("ogun_core.hardware._probe_intel_gpus", side_effect=RuntimeError("Intel probe failed")), \
+         patch("ogun_core.hardware._probe_ram", side_effect=RuntimeError("RAM probe failed")), \
+         patch("ogun_core.hardware._probe_cpu_cores", side_effect=RuntimeError("Core probe failed")):
         hw_crash = hardware.probe_hardware()
         assert isinstance(hw_crash, HardwareInfo)
         assert hw_crash.gpu is None
@@ -435,7 +435,7 @@ def test_format_banner_ascii_and_safety():
     banner_gpu = format_banner(hw_gpu, prof_gpu)
 
     assert banner_gpu.isascii(), "Banner must be pure ASCII (no unicode box-drawing or emoji)"
-    assert "HELIX HARDWARE PROFILE & RUNTIME" in banner_gpu
+    assert "OGUN HARDWARE PROFILE & RUNTIME" in banner_gpu
     assert "Tier:" in banner_gpu
     assert "Model:" in banner_gpu
     assert "Recommended:" in banner_gpu
@@ -456,8 +456,8 @@ def test_format_banner_ascii_and_safety():
 
 def test_integration_and_static_guards():
     """Live config follows the profile; --hardware-info works; no static copies of tunables."""
-    from helix_core import config as cfg
-    from helix_core.engine import ContextManager, handle_vram_command
+    from ogun_core import config as cfg
+    from ogun_core.engine import ContextManager, handle_vram_command
 
     saved = dict(cfg._ACTIVE)
     try:
@@ -480,7 +480,7 @@ def test_integration_and_static_guards():
     try:
         cfg.apply_hardware_profile({"num_ctx": 6144, "num_gpu": 30, "gpu_units": 30, "total_units": 49, "mode": "hybrid",
                                     "model_tag": cfg.MODEL_NAME, "num_thread": 8})
-        with patch("helix_core.engine.ollama_ps", return_value=[]):
+        with patch("ogun_core.engine.ollama_ps", return_value=[]):
             reply = handle_vram_command("/vram status")
         assert "AUTO" in reply and "30/49" in reply and "6144" in reply, reply
     finally:
@@ -491,13 +491,13 @@ def test_integration_and_static_guards():
     proc = subprocess.run([sys.executable, str(BASE / "main.py"), "--hardware-info"], cwd=str(BASE),
                           capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
     assert proc.returncode == 0, proc.stderr
-    assert "HELIX HARDWARE PROFILE & RUNTIME" in proc.stdout
+    assert "OGUN HARDWARE PROFILE & RUNTIME" in proc.stdout
     assert "Goodbye" not in proc.stdout
 
     # static guard: nobody may copy NUM_CTX at import time (it would ignore the auto-tuned window)
     pat = re.compile(r"=\s*NUM_CTX|max_tokens\s*:\s*int\s*=\s*NUM_CTX|\"num_ctx\"\s*:\s*NUM_CTX")
     bad = []
-    for path in (BASE / "helix_core").glob("*.py"):
+    for path in (BASE / "ogun_core").glob("*.py"):
         if path.name == "config.py":
             continue
         for i, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
@@ -509,8 +509,8 @@ def test_integration_and_static_guards():
 def test_config_override_flags_and_boot_hook():
     """autotune.cli_overrides parses flags; boot() skips on --vram / env, applies a profile otherwise, never raises."""
     import argparse
-    from helix_core import autotune
-    from helix_core import config as cfg
+    from ogun_core import autotune
+    from ogun_core import config as cfg
 
     p = argparse.ArgumentParser()
     autotune.add_arguments(p)
@@ -530,10 +530,10 @@ def test_config_override_flags_and_boot_hook():
         # probe failure must degrade to defaults, not raise
         c = p.parse_args([])
         c.vram = None
-        with patch.dict(os.environ, {"HELIX_VRAM_PROFILE": "", "HELIX_NUM_GPU": ""}),              patch("helix_core.autotune.hardware.probe_hardware", side_effect=RuntimeError("boom")):
+        with patch.dict(os.environ, {"OGUN_VRAM_PROFILE": "", "OGUN_NUM_GPU": ""}),              patch("ogun_core.autotune.hardware.probe_hardware", side_effect=RuntimeError("boom")):
             assert autotune.boot(c, cfg.MODEL_NAME, cfg.OLLAMA_HOST) is None
         # successful boot with a fake machine applies AUTO + saves the profile in a temp location
-        with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"HELIX_VRAM_PROFILE": "", "HELIX_NUM_GPU": ""}),              patch("helix_core.autotune.PROFILE_PATH", Path(td) / "hardware_profile.json"),              patch("helix_core.autotune.hardware.probe_hardware", return_value=_nvidia_pc(total=24.0, free=22.0)),              patch("helix_core.autotune.hardware.query_ollama", return_value={"reachable": False, "installed": [], "resident": [],
+        with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"OGUN_VRAM_PROFILE": "", "OGUN_NUM_GPU": ""}),              patch("ogun_core.autotune.PROFILE_PATH", Path(td) / "hardware_profile.json"),              patch("ogun_core.autotune.hardware.probe_hardware", return_value=_nvidia_pc(total=24.0, free=22.0)),              patch("ogun_core.autotune.hardware.query_ollama", return_value={"reachable": False, "installed": [], "resident": [],
                                                                                "resident_vram_gb": 0.0, "resident_ram_gb": 0.0}):
             applied = autotune.boot(c, cfg.MODEL_NAME, cfg.OLLAMA_HOST)
             assert applied and cfg.get_vram_profile() == "AUTO" and cfg.get_num_ctx() == applied["num_ctx"]

@@ -1,4 +1,4 @@
-"""Helix honesty guard.
+"""Ogun honesty guard.
 
 Validates assistant responses against real tool execution logs.
 Prevents hallucinated claims of file creation or test execution when
@@ -151,7 +151,7 @@ def sanitize_reply(
             )
         else:
             notes.append(
-                "**Real Test Status:** No tests were executed by Helix during this turn. "
+                "**Real Test Status:** No tests were executed by Ogun during this turn. "
                 "Invented test output was removed."
             )
 

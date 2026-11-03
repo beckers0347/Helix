@@ -1,4 +1,4 @@
-"""Helix software quality and static analysis utilities.
+"""Ogun software quality and static analysis utilities.
 
 Provides static requirements coverage verification and project classification.
 """
@@ -18,7 +18,7 @@ from typing import Any, NamedTuple, Dict, List, Optional, Set, Tuple
 
 
 _FLAG_PATTERN = re.compile(r"--([a-zA-Z0-9_\-]+)")
-_PLUGIN_KEYWORDS = {"plugin", "dynamic tool", "helix tool", "add tool to helix", "basetool"}
+_PLUGIN_KEYWORDS = {"plugin", "dynamic tool", "ogun tool", "add tool to ogun", "basetool"}
 _STANDALONE_PATTERNS = [
     re.compile(r"\bcommand-line tool\b", re.IGNORECASE),
     re.compile(r"\bcommand line tool\b", re.IGNORECASE),
@@ -38,7 +38,7 @@ def is_standalone_project_intent(prompt: str) -> bool:
     if not prompt or not isinstance(prompt, str):
         return False
     lower = prompt.lower()
-    if any(k in lower for k in ("plugin", "dynamic tool", "helix tool", "basetool")):
+    if any(k in lower for k in ("plugin", "dynamic tool", "ogun tool", "basetool")):
         return False
     return any(p.search(prompt) for p in _STANDALONE_PATTERNS)
 
@@ -2402,7 +2402,7 @@ def try_rewrite_failing_test(
         try:
             ast.parse(rep_code)
             test_path.write_text(rep_code, encoding="utf-8")
-            from helix_core.codetools import run_python_test
+            from ogun_core.codetools import run_python_test
             out = run_python_test(str(test_path), base_dir=project_dir)
             passed = ("TEST PASS" in out or "OK" in out) and not ("FAIL" in out or "ERROR" in out)
             if (passed or (f"FAIL: {test_name}" not in out and f"ERROR: {test_name}" not in out)) and "Ran " in out:
@@ -2447,7 +2447,7 @@ def try_rewrite_failing_test(
         try:
             ast.parse(rewritten)
             test_path.write_text(rewritten, encoding="utf-8")
-            from helix_core.codetools import run_python_test
+            from ogun_core.codetools import run_python_test
             out = run_python_test(str(test_path), base_dir=project_dir)
             passed = ("TEST PASS" in out or "OK" in out) and not ("FAIL" in out or "ERROR" in out)
             if (passed or (f"FAIL: {test_name}" not in out and f"ERROR: {test_name}" not in out)) and "Ran " in out:
@@ -2487,7 +2487,7 @@ def quarantine_bad_tests(
         try:
             ast.parse(repaired_code)
             test_path.write_text(repaired_code, encoding="utf-8")
-            from helix_core.codetools import run_python_test
+            from ogun_core.codetools import run_python_test
             re_output = run_python_test(str(test_path), base_dir=project_dir)
             re_passed = ("TEST PASS" in re_output or "OK" in re_output) and not ("FAIL" in re_output or "ERROR" in re_output)
             if re_passed:
@@ -2547,7 +2547,7 @@ def quarantine_bad_tests(
             match = re.search(pattern, content)
             if match:
                 indent = match.group(1)
-                full_reason = f"Quarantined by Helix: {reason} ({test_name})"
+                full_reason = f"Quarantined by Ogun: {reason} ({test_name})"
                 replacement = f"{indent}@unittest.skip({full_reason!r})\n{indent}def {test_name}("
                 content = re.sub(pattern, replacement, content, count=1)
                 quarantined.append({"name": test_name, "reason": reason})
@@ -2614,7 +2614,7 @@ def ensure_options_coverage_or_gap(
             try:
                 ast.parse(cand_content)
                 test_path.write_text(cand_content, encoding="utf-8")
-                from helix_core.codetools import run_python_test
+                from ogun_core.codetools import run_python_test
                 out = run_python_test(str(test_path), base_dir=project_dir)
                 passed = ("TEST PASS" in out or "OK" in out) and not ("FAIL" in out or "ERROR" in out)
                 if passed:
@@ -3759,7 +3759,7 @@ def _compute_final_status_core(
     # 2. Check scaffold & validate test file
     has_scaffold = (project_dir / "_scaffold.py").exists() or ("_scaffold" in test_code)
     if not (project_dir / "_scaffold.py").exists() and ("ToolTestCase" in test_code or "_scaffold" in test_code):
-        from helix_core.standalone_builder import write_scaffold_file
+        from ogun_core.standalone_builder import write_scaffold_file
         write_scaffold_file(project_dir, project_name)
         has_scaffold = True
 

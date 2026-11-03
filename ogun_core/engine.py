@@ -1,4 +1,4 @@
-"""Helix Core Engine.
+"""Ogun Core Engine.
 
 Coordinates the headless chat loop, Ollama API interactions, bounded context window,
 native and text-based tool execution, and the dynamic plugin registry.
@@ -12,8 +12,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import urllib.error
 import urllib.request
 
-from helix_core.base_tool import BaseTool, ToolResult
-from helix_core.codetools import (
+from ogun_core.base_tool import BaseTool, ToolResult
+from ogun_core.codetools import (
     check_syntax,
     create_plugin,
     list_plugins,
@@ -22,7 +22,7 @@ from helix_core.codetools import (
     run_python_test,
     write_file,
 )
-from helix_core.config import (
+from ogun_core.config import (
     KEEP_ALIVE,
     MODEL_NAME,
     NUM_CTX,
@@ -45,11 +45,11 @@ from helix_core.config import (
     resolve_vram_profile,
     set_vram_profile,
 )
-from helix_core.honesty import TurnEvents, sanitize_reply
-from helix_core.paths import HELIX_ROOT
-from helix_core.plugin_manager import PluginManager
-from helix_core.security import PathSecurityGuard
-from helix_core.toolcalls import parse_tool_calls
+from ogun_core.honesty import TurnEvents, sanitize_reply
+from ogun_core.paths import OGUN_ROOT
+from ogun_core.plugin_manager import PluginManager
+from ogun_core.security import PathSecurityGuard
+from ogun_core.toolcalls import parse_tool_calls
 
 BUILTIN_TOOL_SCHEMAS = [
     {
@@ -311,7 +311,7 @@ class ContextManager:
 
 
 class CoreEngine:
-    """Helix Core Engine handling execution turns and tool dispatches."""
+    """Ogun Core Engine handling execution turns and tool dispatches."""
 
     def __init__(
         self,
@@ -320,7 +320,7 @@ class CoreEngine:
         security_guard: Optional[PathSecurityGuard] = None,
         base_dir: Optional[Path] = None,
     ) -> None:
-        self.base_dir = (base_dir or HELIX_ROOT).resolve()
+        self.base_dir = (base_dir or OGUN_ROOT).resolve()
         self.client = client or OllamaClient()
         self.plugin_manager = plugin_manager or PluginManager(base_dir=self.base_dir)
         self.security_guard = security_guard or PathSecurityGuard(base_dir=self.base_dir)
@@ -462,9 +462,9 @@ class CoreEngine:
             )
 
         # Check if standalone CLI project request
-        from helix_core.quality import classify_project_request
+        from ogun_core.quality import classify_project_request
         if classify_project_request(effective_user_text) == "standalone" and clean_user not in continuation_words:
-            from helix_core.standalone_builder import build_standalone_project_staged
+            from ogun_core.standalone_builder import build_standalone_project_staged
             try:
                 success, final_msg, details = build_standalone_project_staged(self, effective_user_text)
                 is_timeout = "timed out" in final_msg.lower() or details.get("status") == "timeout"
@@ -652,7 +652,7 @@ def _describe_loaded(models: List[Dict[str, Any]]) -> str:
 
 def _vram_auto(model: str, host: str) -> str:
     """/vram auto: probe this machine again, tune against what is free RIGHT NOW (memory held by the loaded model counts as free), apply."""
-    from helix_core import hardware
+    from ogun_core import hardware
     try:
         hw = hardware.probe_hardware()
         oll = hardware.query_ollama(host, family=str(model).split(":")[0])

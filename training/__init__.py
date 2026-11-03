@@ -1,1 +1,1 @@
-"""Helix Training Pipeline Package."""
+"""Ogun Training Pipeline Package."""

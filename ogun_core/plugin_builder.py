@@ -1,4 +1,4 @@
-"""Helix dynamic plugin staged builder and self-correction loop.
+"""Ogun dynamic plugin staged builder and self-correction loop.
 
 Coordinates staged code generation (tool implementation, then unit tests)
 and iterative self-correction with bounded retries.
@@ -8,10 +8,10 @@ from __future__ import annotations
 import re
 from typing import Any, List, Optional, Tuple
 
-from helix_core.config import PLUGIN_BUILDER_PROMPT
-from helix_core.engine import CoreEngine
-from helix_core.plugin_manager import PluginManager
-from helix_core.quality import check_requirements_coverage
+from ogun_core.config import PLUGIN_BUILDER_PROMPT
+from ogun_core.engine import CoreEngine
+from ogun_core.plugin_manager import PluginManager
+from ogun_core.quality import check_requirements_coverage
 
 
 def parse_code_blocks(text: str) -> List[str]:

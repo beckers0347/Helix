@@ -1,6 +1,6 @@
-"""Helix unified path resolvers and directory configuration.
+"""Ogun unified path resolvers and directory configuration.
 
-All paths are strictly relative to the Helix installation root.
+All paths are strictly relative to the Ogun installation root.
 No paths are created at import time.
 """
 from __future__ import annotations
@@ -13,25 +13,25 @@ import sys
 IS_FROZEN = getattr(sys, "frozen", False)
 
 if IS_FROZEN:
-    HELIX_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Helix"
+    OGUN_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Ogun"
 else:
-    HELIX_ROOT = Path(__file__).resolve().parents[1]
+    OGUN_ROOT = Path(__file__).resolve().parents[1]
 
 # Core engine paths
-HELIX_CORE_DIR = (HELIX_ROOT / "helix_core").resolve()
+OGUN_CORE_DIR = (OGUN_ROOT / "ogun_core").resolve()
 
 # Dynamic plugin paths
-PLUGINS_DIR = (HELIX_ROOT / "plugins").resolve()
+PLUGINS_DIR = (OGUN_ROOT / "plugins").resolve()
 CUSTOM_TOOLS_DIR = (PLUGINS_DIR / "custom_tools").resolve()
 PLUGINS_TESTS_DIR = (PLUGINS_DIR / "tests").resolve()
 QUARANTINE_DIR = (PLUGINS_DIR / "quarantine").resolve()
 REGISTRY_PATH = (PLUGINS_DIR / "registry.json").resolve()
 
 # User workspace
-WORKSPACE_DIR = (HELIX_ROOT / "workspace").resolve()
+WORKSPACE_DIR = (OGUN_ROOT / "workspace").resolve()
 
 # Training & dataset paths
-TRAINING_DIR = (HELIX_ROOT / "training").resolve()
+TRAINING_DIR = (OGUN_ROOT / "training").resolve()
 TRAINING_DATA_DIR = (TRAINING_DIR / "data").resolve()
 TRAINING_RAW_DIR = (TRAINING_DATA_DIR / "raw").resolve()
 TRAINING_TOKENIZED_DIR = (TRAINING_DATA_DIR / "tokenized").resolve()

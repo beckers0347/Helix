@@ -1,6 +1,6 @@
-# Helix Training Data & Model Artifacts
+# Ogun Training Data & Model Artifacts
 
-This directory holds dataset caches, normalized DPO pairs, tokenized data, and model export artifacts for the Helix local training pipeline.
+This directory holds dataset caches, normalized DPO pairs, tokenized data, and model export artifacts for the Ogun local training pipeline.
 
 ## Directory Structure:
 - `raw/`: Raw downloaded datasets and chunks (cached from Hugging Face).

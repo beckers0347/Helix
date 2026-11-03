@@ -1,4 +1,4 @@
-# Helix DPO Fine-Tuning Dependencies
+# Ogun DPO Fine-Tuning Dependencies
 # Target Hardware: NVIDIA GeForce RTX 5070 (12 GB VRAM, Blackwell sm_120), Windows 10/11
 # Python: 3.12 64-bit with CUDA 12.8
 #

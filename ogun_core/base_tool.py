@@ -1,4 +1,4 @@
-"""Helix BaseTool interface and contract for all dynamic tools and plugins.
+"""Ogun BaseTool interface and contract for all dynamic tools and plugins.
 
 Every dynamic tool authored by the AI or user must inherit from BaseTool,
 define required metadata, and implement execute(**kwargs) returning a ToolResult:
