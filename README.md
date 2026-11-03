@@ -8,7 +8,7 @@
 - **GPU-aware**: switch between "max speed" and "leave VRAM for other apps" with a chat command.
 
 > **Platform:** Windows 10/11 (the launchers are `.bat` files). The Python code itself is portable, but only Windows has been tested.
-> **Status:** the chat engine, plugin builder and data pipeline are tested and working. The fine-tuning step has **not** been run end to end yet (see [Training](#training-optional)).
+> **Status: public beta (v0.1.0-beta).** The chat engine, plugin builder, tool builder and data pipeline are tested and working. The fine-tuning step has **not** been run end to end yet (see [Training](#training-optional)). Please [report what breaks](#feedback-and-bug-reports).
 
 ---
 
@@ -83,6 +83,16 @@ run_helix.bat --unload
 Helix gives the model a small set of tools and runs the tool calls it makes: read files, **write new files**, **replace text in existing files** (exact match), check Python syntax, run a Python test in an isolated process, create plugins and list them. Tool calls work both when the model returns them natively and when a smaller model prints them as text (fenced JSON, bare JSON, `<tool_call>` blocks, arguments given as a JSON string, ...).
 
 Writes are limited to the three safe folders (see [Safety](#safety-model)).
+
+### Building command-line tools
+
+Describe a standalone command-line tool in the chat and Helix builds it as a separate project under `workspace/`:
+
+```text
+Helix > Build a command-line tool called colsum that reads a CSV file and prints count, min, max and mean for each numeric column, with --json output
+```
+
+Helix writes the tool, a unit test suite and a README, then checks the result itself: smoke tests on sample inputs, output checks against independently computed values, a 50 MB memory test and the generated unit tests. When something fails it feeds the exact failures back to the model and retries. The final status (`PASSED`, `PASSED WITH ISSUES` or `REQUIREMENT FAILED`) says honestly whether the tool works, and the full log is kept in the project's `.build_log` folder.
 
 ---
 
@@ -268,6 +278,8 @@ py -3.12 tests\run_all.py
 | `tests/test_helix_core.py` (14) | tool-call parser, security guard, plugin lifecycle and registry safety, engine loop, code tools, UTF-8 subprocess output, `/vram` and GPU profiles |
 | `tests/test_training_data.py` (21) | dataset mappers, synthetic pairs, cleaning/filters, resumable downloads, verification |
 | `tests/test_training_trainer.py` (36) | prompt rendering, TRL-version compatibility, CLI, dataset reader, dry-run |
+| `tests/test_hardware.py` (11) | hardware probe and auto-tuner |
+| `tests/test_dev_fixes.py` (149) | standalone tool builder: checks, oracles, flow analysis, arbitration, fix feedback, scripted end-to-end builds |
 
 ## Safety model
 
@@ -315,6 +327,28 @@ Every path Helix uses is resolved relative to its own folder, so you can clone o
 | The launcher won't start in a folder with spaces | it quotes paths and works in folders like `C:\Users\Jane Doe\Helix`; if it fails, re-download and check antivirus quarantine |
 | The plugin builder gives up | try again (small models are not always right the first time), or write the plugin yourself using the contract above |
 
+## Known limitations
+
+- **Windows only so far.** The launchers are `.bat` files; macOS and Linux are untested.
+- **Small local models make mistakes.** Builds can take several attempts, and some fail. Larger models do better but need more VRAM.
+- **Slow without a GPU.** CPU-only works, but replies and builds take much longer.
+- **The tool builder is best at single-file Python command-line tools** (text, CSV and JSON processing). Multi-file apps, GUIs and web servers are out of scope for now.
+- **Fine-tuning is unverified end to end.**
+
+## Feedback and bug reports
+
+Helix is in public beta and your feedback decides what gets fixed next. Please use [GitHub Issues](https://github.com/beckers0347/Helix/issues/new/choose):
+
+- **Bug report**: crashes, errors, wrong behaviour.
+- **Build failed**: a tool or plugin build that failed or produced wrong output. Attach the `.build_log` if you can.
+- **Feedback**: what you used it for, what's missing, what you'd want next.
+
+Including the output of `run_helix.bat --hardware-info` helps a lot. Pull requests aren't accepted right now; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
-Helix is released under the [MIT License](LICENSE).
+Helix is **source-available** under the [Functional Source License 1.1, MIT Future License](LICENSE) (FSL-1.1-MIT):
+
+- You may use, modify and share Helix for any purpose **except** offering it, or something substantially similar, as a competing commercial product or service.
+- Personal use, use inside your company, education and research are all fine.
+- Each version automatically becomes available under the MIT License two years after it is released.

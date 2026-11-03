@@ -1,0 +1,37 @@
+name: Tool or plugin build failed
+description: You asked Helix to build a tool or plugin and it failed or produced wrong output.
+labels: [builder]
+body:
+  - type: textarea
+    id: request
+    attributes:
+      label: Exact request you gave Helix
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What went wrong?
+      description: The final status Helix printed, and what the tool did wrong (if it was built).
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Build log
+      description: Attach or paste the build log from the project's `.build_log` folder under `workspace/`.
+      render: text
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      placeholder: qwen2.5-coder:14b
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Your setup
+      description: Output of `run_helix.bat --hardware-info`.
+      render: text

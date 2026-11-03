@@ -1,0 +1,35 @@
+name: Bug report
+description: Helix crashed, gave an error, or did something wrong.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. run_helix.bat
+        2. typed "..."
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Error output
+      description: Paste the console output. Remove anything private first.
+      render: text
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Your setup
+      description: Paste the output of `run_helix.bat --hardware-info`, plus your Windows version and Ollama model.
+      render: text
+    validations:
+      required: true
