@@ -2072,7 +2072,16 @@ def main():
                         except ValueError:
                             pass
         stats = {}
-        target_cols = [args.column] if args.column and args.column in headers else headers
+        if args.column:
+            if args.column not in headers:
+                sys.stderr.write(f"Error: Unknown column '{args.column}'\\n")
+                sys.exit(1)
+            if not col_vals.get(args.column):
+                sys.stderr.write(f"Error: Non-numeric column '{args.column}'\\n")
+                sys.exit(1)
+            target_cols = [args.column]
+        else:
+            target_cols = [h for h in headers if col_vals.get(h)]
         for h in target_cols:
             vals = col_vals.get(h, [])
             if vals:
@@ -2080,11 +2089,20 @@ def main():
         if args.json:
             print(json.dumps(stats))
         else:
-            if not stats:
-                print("No numeric columns found.")
-                return
-            for h, s in stats.items():
-                print(f"| {h} | {s['count']} | {s['min']} | {s['max']} | {s['mean']:.2f} |")
+            headers_t = ["Column", "Count", "Min", "Max", "Mean"]
+            rows_t = []
+            for h in target_cols:
+                v = stats.get(h)
+                if v:
+                    rows_t.append([h, str(v['count']), f"{v['min']:.1f}", f"{v['max']:.1f}", f"{v['mean']:.4f}"])
+            widths = [len(x) for x in headers_t]
+            for r in rows_t:
+                for i, val in enumerate(r):
+                    widths[i] = max(widths[i], len(val))
+            header_line = ' | '.join(f'{h:<{w}}' for h, w in zip(headers_t, widths))
+            sep_line = '-+-'.join('-' * w for w in widths)
+            data_lines = [' | '.join(f'{c:<{w}}' for c, w in zip(r, widths)) for r in rows_t]
+            print('\\n'.join([header_line, sep_line] + data_lines))
 if __name__ == '__main__': main()
 """, encoding="utf-8")
 
@@ -2484,6 +2502,493 @@ class TestLinecount(ToolTestCase):
     assert arb4["lock_tool"] is True
 
 
+# -----------------------------------------------------------------------------
+# Round 9: Input Kind Inference, Mismatched Fixture Rejection, Flag Combinations,
+# Spec Fidelity, Row Consistency & Report Consistency
+# -----------------------------------------------------------------------------
+
+def test_r9_input_kind_inference_and_fixtures():
+    from helix_core.quality import infer_tool_input_kind, fixtures_for
+
+    req_csv = "Build me a command-line tool called colsummary. Give it a CSV file with a header row and it prints stats."
+    kind_csv = infer_tool_input_kind(req_csv, {}, "", "colsummary")
+    assert kind_csv == "csv", f"Expected 'csv', got {kind_csv}"
+    fx_csv = fixtures_for(kind_csv)
+    assert "tiny_valid" in fx_csv and ".csv" in fx_csv["tiny_valid"]["name"]
+    assert any("self.csv_file" in h for h in fx_csv["ready_helpers"])
+
+    req_text = "Build me a command-line tool called textsummary. Give it one or more text files and it prints lines and words."
+    kind_text = infer_tool_input_kind(req_text, {}, "", "textsummary")
+    assert kind_text in ("plain_text/lines", "multi_file"), f"Expected text or multi_file, got {kind_text}"
+    fx_text = fixtures_for(kind_text)
+    assert "tiny_valid" in fx_text
+
+    req_json = "Build me a tool that parses a json file and extracts keys."
+    kind_json = infer_tool_input_kind(req_json, {}, "", "jsonutil")
+    assert kind_json == "json", f"Expected 'json', got {kind_json}"
+
+    req_dir = "Build me a tool that scans a folder or directory for images."
+    kind_dir = infer_tool_input_kind(req_dir, {}, "", "dirscan")
+    assert kind_dir == "folder/directory", f"Expected 'folder/directory', got {kind_dir}"
+
+
+def test_r9_mismatched_fixture_validator_rejection():
+    from helix_core.quality import validate_generated_test_file
+
+    req_csv = "Build me a command-line tool called colsummary. Give it a CSV file with a header row. It needs a --json option."
+    bad_test_json_fixture = """from _scaffold import ToolTestCase
+import unittest
+
+class TestColsummary(ToolTestCase):
+    def test_basic(self):
+        f = self.write_file("input.json", '{"a": 1, "b": 2}')
+        res = self.run_tool(str(f))
+        self.assertOk(res)
+
+if __name__ == '__main__':
+    unittest.main()
+"""
+    valid, issues, _ = validate_generated_test_file(bad_test_json_fixture, "colsummary", request=req_csv)
+    assert not valid, f"Expected mismatched fixture rejection, but passed. Issues: {issues}"
+    assert any("mismatched" in i.lower() or ".json" in i.lower() for i in issues), f"Unexpected issues: {issues}"
+
+    good_test_csv_fixture = """from _scaffold import ToolTestCase
+import unittest
+
+class TestColsummary(ToolTestCase):
+    def test_basic(self):
+        f = self.csv_file("input.csv", "a,b\\n1,2\\n3,4")
+        res = self.run_tool(str(f))
+        self.assertOk(res)
+
+if __name__ == '__main__':
+    unittest.main()
+"""
+    valid_good, issues_good, _ = validate_generated_test_file(good_test_csv_fixture, "colsummary", request=req_csv)
+    assert valid_good, f"Expected valid CSV test to pass, but failed: {issues_good}"
+
+
+def test_r9_oracle_full_flag_combination_mode_matrix():
+    from helix_core.quality import OracleRegistry
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Defective tool: ignores --column when --json is passed (Round 8 defect)
+        buggy_tool = tmp_path / "buggy_colsummary.py"
+        buggy_tool.write_text("""import argparse, sys, json, csv
+parser = argparse.ArgumentParser()
+parser.add_argument('file')
+parser.add_argument('--column')
+parser.add_argument('--delimiter', default=',')
+parser.add_argument('--json', action='store_true')
+args = parser.parse_args()
+
+with open(args.file, encoding='utf-8') as f:
+    r = csv.DictReader(f, delimiter=args.delimiter)
+    cols = {}
+    for row in r:
+        for k, v in row.items():
+            try:
+                val = float(v)
+                cols.setdefault(k, []).append(val)
+            except (ValueError, TypeError):
+                pass
+
+stats = {}
+for k, vals in cols.items():
+    stats[k] = {"count": len(vals), "min": min(vals), "max": max(vals), "mean": sum(vals)/len(vals)}
+
+if args.json:
+    # BUG: Outputs ALL columns in JSON, completely ignoring args.column!
+    print(json.dumps(stats))
+else:
+    table_stats = stats
+    if args.column:
+        table_stats = {k: v for k, v in stats.items() if k == args.column}
+    print("Column | Count | Min  | Max  | Mean")
+    print("-------+-------+------+------+-----")
+    for k, s in table_stats.items():
+        print(f"{k:<6} | {s['count']:<5} | {s['min']:<4.1f} | {s['max']:<4.1f} | {s['mean']:<4.1f}")
+""", encoding="utf-8")
+
+        ok_buggy, err_buggy = OracleRegistry.oracle_csv_column_stats(buggy_tool, "Build colsummary with --json --column --delimiter", tmp_path)
+        assert not ok_buggy, f"Oracle should have caught defective --column --json, got err: {err_buggy}"
+        assert "--column" in err_buggy and "--json" in err_buggy, f"Defect not found in error: {err_buggy}"
+
+        # Correct tool
+        good_tool = tmp_path / "good_colsummary.py"
+        good_tool.write_text("""import argparse, sys, json, csv
+parser = argparse.ArgumentParser()
+parser.add_argument('file')
+parser.add_argument('--column')
+parser.add_argument('--delimiter', default=',')
+parser.add_argument('--json', action='store_true')
+args = parser.parse_args()
+
+with open(args.file, encoding='utf-8') as f:
+    r = csv.DictReader(f, delimiter=args.delimiter)
+    all_fields = r.fieldnames or []
+    cols = {}
+    for row in r:
+        for k, v in row.items():
+            try:
+                val = float(v)
+                cols.setdefault(k, []).append(val)
+            except (ValueError, TypeError):
+                pass
+
+if args.column:
+    if args.column not in all_fields:
+        sys.stderr.write(f"Error: Unknown column '{args.column}'\\n")
+        sys.exit(1)
+    if args.column not in cols or not cols[args.column]:
+        sys.stderr.write(f"Error: Non-numeric column '{args.column}'\\n")
+        sys.exit(1)
+    cols = {k: v for k, v in cols.items() if k == args.column}
+
+stats = {}
+for k, vals in cols.items():
+    stats[k] = {"count": len(vals), "min": min(vals), "max": max(vals), "mean": sum(vals)/len(vals)}
+
+if args.json:
+    print(json.dumps(stats))
+else:
+    headers = ["Column", "Count", "Min", "Max", "Mean"]
+    rows = []
+    for k, s in stats.items():
+        rows.append([k, str(s['count']), f"{s['min']:.1f}", f"{s['max']:.1f}", f"{s['mean']:.4f}"])
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, val in enumerate(row):
+            widths[i] = max(widths[i], len(val))
+    header_line = ' | '.join(f'{h:<{w}}' for h, w in zip(headers, widths))
+    sep_line = '-+-'.join('-' * w for w in widths)
+    data_lines = [' | '.join(f'{c:<{w}}' for c, w in zip(row, widths)) for row in rows]
+    print('\\n'.join([header_line, sep_line] + data_lines))
+""", encoding="utf-8")
+
+        ok_good, err_good = OracleRegistry.oracle_csv_column_stats(good_tool, "Build colsummary with --json --column --delimiter", tmp_path)
+        assert ok_good, f"Oracle should have passed conforming tool, got error: {err_good}"
+
+
+def test_r9_spec_fidelity_ignoring_non_numeric_and_unrequested_options():
+    from helix_core.quality import check_unrequested_cli_options, OracleRegistry
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Non-numeric column presence defect in CSV stats
+        leaky_tool = tmp_path / "leaky_colsummary.py"
+        leaky_tool.write_text("""import argparse, sys, json
+parser = argparse.ArgumentParser()
+parser.add_argument('file')
+parser.add_argument('--column')
+parser.add_argument('--delimiter', default=',')
+parser.add_argument('--json', action='store_true')
+args = parser.parse_args()
+
+if args.json:
+    # Leaks 'name' (non-numeric column)
+    print(json.dumps({'col_a': {'count': 2, 'min': 10, 'max': 20, 'mean': 15}, 'name': {'count': 0}}))
+else:
+    print("Column | Count | Min | Max | Mean")
+    print("-------+-------+-----+-----+-----")
+    print("col_a  | 2     | 10  | 20  | 15")
+    print("name   | 0     | 0   | 0   | 0")
+""", encoding="utf-8")
+
+        ok_leaky, err_leaky = OracleRegistry.oracle_csv_column_stats(leaky_tool, "Build colsummary with --json --column --delimiter", tmp_path)
+        assert not ok_leaky, "Oracle must fail when non-numeric column is present"
+        assert "non-numeric" in err_leaky.lower() or "name" in err_leaky.lower(), f"Unexpected error: {err_leaky}"
+
+    # Unrequested CLI options check
+    req = "Build me a command-line tool colsummary for CSV files. Needs --json and --delimiter."
+    contract = {
+        "optional_options": [
+            {"flags": ["--json"], "dest": "json"},
+            {"flags": ["--delimiter"], "dest": "delimiter"},
+            {"flags": ["--unwanted-flag"], "dest": "unwanted"},
+        ]
+    }
+    unreq = check_unrequested_cli_options(contract, req)
+    assert unreq == ["--unwanted-flag"], f"Expected ['--unwanted-flag'], got {unreq}"
+
+    tool_code_with_unreq = """import argparse
+p = argparse.ArgumentParser()
+p.add_argument('--json', action='store_true')
+p.add_argument('--delimiter', default=',')
+p.add_argument('--foo-bar')
+"""
+    unreq_code = check_unrequested_cli_options(tool_code_with_unreq, req)
+    assert "--foo-bar" in unreq_code, f"Expected '--foo-bar' in {unreq_code}"
+
+
+def test_r9_table_row_column_consistency():
+    from helix_core.quality import check_table_row_column_consistency
+
+    good_table = """
+Column | Count | Min | Max | Mean
+-------+-------+-----+-----+-----
+col_a  | 2     | 1.0 | 2.0 | 1.5
+col_b  | 2     | 3.0 | 4.0 | 3.5
+"""
+    ok, err = check_table_row_column_consistency(good_table)
+    assert ok, f"Good table should pass, got error: {err}"
+
+    bad_table = """
+Column | Count | Min | Max | Mean
+-------+-------+-----+-----+-----
+col_a  | 2     | 1.0 | 2.0 | 1.5
+col_b  | 2     | 3.0
+"""
+    ok_bad, err_bad = check_table_row_column_consistency(bad_table)
+    assert not ok_bad, "Bad table with missing columns must fail"
+    assert "Inconsistent column count" in err_bad
+
+
+def test_r9_report_consistency_verifier():
+    from helix_core.quality import verify_report_consistency
+
+    contradictory_report = """# Round 9 Report
+| Flag | Result |
+|---|---|
+| `--column col_a --json` | PASS |
+
+## Gaps I did not close
+- Defect: `--column col_a --json` is broken and ignores the column argument.
+"""
+    ok, issues = verify_report_consistency(contradictory_report)
+    assert not ok, f"Expected contradiction detection, but passed. Issues: {issues}"
+    assert len(issues) >= 1
+    assert "Contradiction detected" in issues[0]
+
+    consistent_report = """# Round 9 Report
+| Flag | Result |
+|---|---|
+| `--column col_a --json` | PASS |
+
+## Gaps I did not close
+- None. All flag combinations and oracles pass.
+"""
+    ok_cons, issues_cons = verify_report_consistency(consistent_report)
+    assert ok_cons, f"Expected consistent report to pass, got issues: {issues_cons}"
+
+
+# -----------------------------------------------------------------------------
+# Round 10: Deterministic Table Alignment, Row-Order Semantics, Test Repair,
+# Selector Validation & Evidence-Backed Reports
+# -----------------------------------------------------------------------------
+
+def test_r10_table_layout_alignment_gate():
+    """R10-1: Deterministic table layout gate in every mode."""
+    from helix_core.quality import check_table_alignment_output
+
+    # 1. Exact textsummary multi-file defect (6 separator segments for 4 columns, pipe index mismatch)
+    broken_textsummary = """File   | Lines  | Words | Characters
+-------+--------+-------+-------+-------+-----------
+f1.txt | 2      | 5     | 24
+Total  | 3      | 7     | 28"""
+    ok_ts, err_ts = check_table_alignment_output(broken_textsummary)
+    assert not ok_ts, "Must catch textsummary multi-file separator segment / boundary mismatch defect"
+    assert "Table alignment error" in err_ts
+    assert "6 segments" in err_ts or "boundary positions mismatch" in err_ts.lower() or "character position mismatch" in err_ts.lower()
+
+    # 2. Exact colsummary Mean column defect (Mean cell 6.666667 exceeds allocated width 6)
+    broken_colsummary = """Column | Count | Min   | Max   | Mean
+-------+-------+-------+-------+------
+b      | 3     | -20.5 | 30.0  | 6.666667"""
+    ok_cs, err_cs = check_table_alignment_output(broken_colsummary)
+    assert not ok_cs, "Must catch colsummary Mean column cell width overflow defect"
+    assert "Table alignment error" in err_cs
+    assert "6.666667" in err_cs or "exceeds" in err_cs
+
+    # 3. Aligned control table (must pass)
+    control_table = """Column | Count | Min   | Max  | Mean    
+-------+-------+-------+------+---------
+b      | 3     | -20.5 | 30.0 | 6.666667"""
+    ok_ctrl, err_ctrl = check_table_alignment_output(control_table)
+    assert ok_ctrl, f"Aligned control table must pass, got: {err_ctrl}"
+
+
+def test_r10_row_order_semantics_totals_and_sorting():
+    """R10-2: Row-order semantics: totals and sorting."""
+    from helix_core.quality import check_listing_row_order_and_totals
+
+    # 1. Exact textsummary --sort Total-first defect (Total sorted together with files)
+    total_first = """Total  | 3      | 7     | 28
+f1.txt | 2      | 5     | 24"""
+    ok_tf, err_tf = check_listing_row_order_and_totals(total_first)
+    assert not ok_tf, "Must catch Total-first defect"
+    assert "Total row must be the LAST row" in err_tf
+
+    # 2. Valid table: Total is last, file rows sorted descending
+    valid_table = """File   | Lines  | Words | Characters
+-------+--------+-------+-----------
+f1.txt | 3      | 9     | 45
+f3.txt | 1      | 6     | 36
+f2.txt | 1      | 2     | 12
+Total  | 5      | 17    | 93"""
+    ok_val, err_val = check_listing_row_order_and_totals(valid_table, is_sorted=True)
+    assert ok_val, f"Valid table must pass, got: {err_val}"
+
+    # 3. JSON mode row order
+    json_bad = """[
+        {"file": "Total", "lines": 5, "words": 17, "characters": 93},
+        {"file": "f1.txt", "lines": 3, "words": 9, "characters": 45}
+    ]"""
+    ok_j_bad, err_j_bad = check_listing_row_order_and_totals(json_bad, is_json=True)
+    assert not ok_j_bad, "JSON with Total first must fail"
+
+
+def test_r10_observed_output_test_repair():
+    """R10-3: Observed-output test repair when tool is proven right (57 vs 58, 99 vs 100, 11.666666666666666 vs 11.666667)."""
+    from helix_core.quality import repair_observed_output_test_defects
+
+    # Test code with real failing assertions from Round 9
+    test_code = """import unittest
+class TestTextsummary(unittest.TestCase):
+    def test_single_file(self):
+        res = self.run_tool("f1.txt")
+        self.assertIn("57", res.stdout)
+
+    def test_single_file_json(self):
+        res = self.run_tool("f1.txt", "--json")
+        data = self.assertJsonOutput(res)
+        self.assertEqual(data[0]["characters"], 57)
+
+    def test_sort_files(self):
+        res = self.run_tool("f1.txt", "f2.txt", "f3.txt", "--sort")
+        self.assertIn("99", res.stdout)
+
+    def test_rich_csv_column(self):
+        res = self.run_tool("rich.csv", "--column", "col_a")
+        self.assertIn('11.666666666666666', res.stdout)
+"""
+
+    failure_output = """FAIL: test_single_file
+AssertionError: '57' not found in 'File   | Lines | Words | Characters\\nf1.txt | 1     | 12    | 58        '
+
+FAIL: test_single_file_json
+AssertionError: 58 != 57
+
+FAIL: test_sort_files
+AssertionError: '99' not found in 'File   | Lines | Words | Characters\\nTotal  | 4     | 19    | 100       '
+
+FAIL: test_rich_csv_column
+AssertionError: '11.666666666666666' not found in 'Column | Count | Min   | Max  | Mean    \\ncol_a  | 3     | -5.0  | 30.0 | 11.666667'
+"""
+
+    repaired, repaired_code = repair_observed_output_test_defects(test_code, failure_output)
+    assert repaired, "repair_observed_output_test_defects must report successful repair"
+    assert 'assertIn("58", res.stdout)' in repaired_code, "57 must be repaired to 58 in assertIn"
+    assert 'assertEqual(data[0]["characters"], 58)' in repaired_code, "57 must be repaired to 58 in assertEqual"
+    assert 'assertIn("100", res.stdout)' in repaired_code, "99 must be repaired to 100"
+    assert "assertIn('11.666667', res.stdout)" in repaired_code, "11.666666666666666 must be repaired to displayed 11.666667"
+
+
+def test_r10_selector_validation():
+    """R10-4: Selector validation for unknown and non-numeric selectors."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("col_num,name\n10,alpha\n20,beta\n", encoding="utf-8")
+
+        # Flawed tool: prints empty table and exits 0 on unknown/non-numeric column
+        flawed_tool = tmp_path / "flawed_sel.py"
+        flawed_tool.write_text("""import argparse, sys
+p = argparse.ArgumentParser()
+p.add_argument('file')
+p.add_argument('--column')
+args = p.parse_args()
+if args.column == 'unknown' or args.column == 'name':
+    sys.exit(0)  # Flaw: exits 0!
+print("col_num | 10..20")
+""", encoding="utf-8")
+
+        # Conforming tool: prints clear error to stderr and exits 1
+        good_tool = tmp_path / "good_sel.py"
+        good_tool.write_text("""import argparse, sys
+p = argparse.ArgumentParser()
+p.add_argument('file')
+p.add_argument('--column')
+args = p.parse_args()
+if args.column:
+    if args.column not in ('col_num', 'name'):
+        sys.stderr.write(f"Error: Unknown column '{args.column}'\\n")
+        sys.exit(1)
+    if args.column == 'name':
+        sys.stderr.write(f"Error: Column '{args.column}' is non-numeric\\n")
+        sys.exit(1)
+print("col_num | 10..20")
+""", encoding="utf-8")
+
+        # Run selector checks
+        p_f = subprocess.run([sys.executable, str(flawed_tool), str(csv_file), "--column", "unknown"], capture_output=True, text=True)
+        assert p_f.returncode == 0, "Flawed tool incorrectly exited 0"
+
+        p_g1 = subprocess.run([sys.executable, str(good_tool), str(csv_file), "--column", "unknown"], capture_output=True, text=True)
+        assert p_g1.returncode != 0, "Conforming tool must exit non-zero on unknown column"
+        assert "error" in p_g1.stderr.lower(), "Conforming tool must print error to stderr on unknown column"
+
+        p_g2 = subprocess.run([sys.executable, str(good_tool), str(csv_file), "--column", "name"], capture_output=True, text=True)
+        assert p_g2.returncode != 0, "Conforming tool must exit non-zero on non-numeric column"
+        assert "error" in p_g2.stderr.lower(), "Conforming tool must print error to stderr on non-numeric column"
+
+
+def test_r10_report_consistency_verifier_evidence_backed():
+    """R10-5: Report consistency check compares claims with pasted evidence."""
+    from helix_core.quality import verify_report_consistency
+
+    # Report claiming PASS for mode whose pasted output fails layout check (6 separator segments)
+    contradictory_layout_report = """# Round 10 Report
+| Mode | Result |
+|---|---|
+| Default Mode | PASS |
+
+```text
+File   | Lines  | Words | Characters
+-------+--------+-------+-------+-------+-----------
+f1.txt | 2      | 5     | 24
+Total  | 3      | 7     | 28
+```
+"""
+    ok_l, iss_l = verify_report_consistency(contradictory_layout_report)
+    assert not ok_l, "Must catch contradiction when pasted output fails table alignment"
+    assert any("fails table alignment gate" in i for i in iss_l)
+
+    # Report claiming PASS for mode whose pasted output fails row-order check (Total first)
+    contradictory_order_report = """# Round 10 Report
+| Mode | Result |
+|---|---|
+| `--sort` | PASS |
+
+```text
+File   | Lines  | Words | Characters
+-------+--------+-------+-----------
+Total  | 3      | 7     | 28
+f1.txt | 2      | 5     | 24
+```
+"""
+    ok_o, iss_o = verify_report_consistency(contradictory_order_report)
+    assert not ok_o, "Must catch contradiction when pasted output fails row-order gate"
+    assert any("fails row-order gate" in i for i in iss_o)
+
+    # Report with valid pasted output passing all checks
+    valid_report = """# Round 10 Report
+| Mode | Result |
+|---|---|
+| Default Mode | PASS |
+
+```text
+Column | Count | Min   | Max  | Mean    
+-------+-------+-------+------+---------
+b      | 3     | -20.5 | 30.0 | 6.666667
+```
+"""
+    ok_v, iss_v = verify_report_consistency(valid_report)
+    assert ok_v, f"Valid evidence-backed report must pass, got: {iss_v}"
+
+
 def run_all_dev_fix_tests() -> bool:
     suites = [
         ("H1: Windows Unicode / cp1252 Smoke & Static Check", test_h1_windows_unicode_cp1252_smoke_and_static_check),
@@ -2546,6 +3051,17 @@ def run_all_dev_fix_tests() -> bool:
         ("R8: Reference Oracle Output Modes & Default Mode Crash", test_r8_oracle_exercises_all_modes_and_catches_default_mode_crash),
         ("R8: Reference Oracle Line Word Count", test_r8_linecount_oracle_word_line_char_counts),
         ("R8: Arbitration Deterministic Linecount Assertion Mismatches", test_r8_arbitration_linecount_assertion_mismatches),
+        ("R9: Input Kind Inference & Fixtures", test_r9_input_kind_inference_and_fixtures),
+        ("R9: Mismatched Fixture Validator Rejection", test_r9_mismatched_fixture_validator_rejection),
+        ("R9: Oracle Full Flag-Combination Mode Matrix", test_r9_oracle_full_flag_combination_mode_matrix),
+        ("R9: Spec Fidelity Ignoring & Unrequested Options", test_r9_spec_fidelity_ignoring_non_numeric_and_unrequested_options),
+        ("R9: Table Row Column Consistency", test_r9_table_row_column_consistency),
+        ("R9: Report Consistency Verifier", test_r9_report_consistency_verifier),
+        ("R10: Table Layout Alignment Gate", test_r10_table_layout_alignment_gate),
+        ("R10: Row-Order Semantics Totals and Sorting", test_r10_row_order_semantics_totals_and_sorting),
+        ("R10: Observed-Output Test Repair", test_r10_observed_output_test_repair),
+        ("R10: Selector Validation", test_r10_selector_validation),
+        ("R10: Report Consistency Verifier Evidence-Backed", test_r10_report_consistency_verifier_evidence_backed),
     ]
 
     print("=" * 60)

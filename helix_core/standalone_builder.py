@@ -30,10 +30,12 @@ from helix_core.quality import (
     assert_status_consistent_with_results,
     check_requirements_coverage,
     check_table_alignment_output,
+    check_table_row_column_consistency,
     check_test_code_hygiene,
     check_tool_code_hygiene,
     check_tool_memory_budget,
     check_undefined_names_and_imports,
+    check_unrequested_cli_options,
     classify_tool_input_kind,
     compute_final_status_from_disk,
     count_test_methods_ast,
@@ -41,6 +43,8 @@ from helix_core.quality import (
     ensure_options_coverage_or_gap,
     ensure_unittest_main_guard,
     extract_requested_flags,
+    fixtures_for,
+    infer_tool_input_kind,
     measure_process_peak_rss,
     parse_unittest_output,
     quarantine_bad_tests,
@@ -52,6 +56,7 @@ from helix_core.quality import (
     validate_generated_test_file,
     validate_test_code_regression,
     validate_tool_code_regression,
+    verify_report_consistency,
 )
 
 
@@ -154,6 +159,36 @@ class ToolTestCase(unittest.TestCase):
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def csv_file(self, name: str, rows: List[List[Any]], delimiter: str = ",") -> Path:
+        """Create a CSV file from list of row lists inside the isolated temp directory."""
+        p = (self.tmp / name).resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        import csv
+        with open(p, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f, delimiter=delimiter)
+            writer.writerows(rows)
+        return p
+
+    def text_file(self, name: str, text: str, encoding: str = "utf-8") -> Path:
+        """Create a plain text file inside the isolated temp directory."""
+        return self.write_file(name, text, encoding=encoding)
+
+    def json_file(self, name: str, obj: Any, encoding: str = "utf-8") -> Path:
+        """Create a JSON file inside the isolated temp directory."""
+        return self.write_file(name, json.dumps(obj, indent=2), encoding=encoding)
+
+    def folder(self, name: str, files: Dict[str, Union[str, bytes]]) -> Path:
+        """Create a directory with relative file paths and contents inside the isolated temp directory."""
+        d = self.make_dir(name)
+        for rel_path, content in files.items():
+            fp = (d / rel_path).resolve()
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(content, bytes):
+                fp.write_bytes(content)
+            else:
+                fp.write_text(content, encoding="utf-8")
+        return d
+
     def run_tool(
         self,
         *args: Any,
@@ -193,6 +228,21 @@ class ToolTestCase(unittest.TestCase):
             self.fail(
                 f"Failed to parse JSON output: {e}\\nreturncode: {rc}\\nstdout: {stdout[:400]!r}\\nstderr: {stderr[:400]!r}"
             )
+
+    def assertOutput(self, result: Union[Result, str], expected: Any, msg: Optional[str] = None) -> None:
+        """Assert output matches expected. Parses JSON if expected is valid JSON string or structure."""
+        exp_clean = str(expected).strip()
+        if (exp_clean.startswith("{") and exp_clean.endswith("}")) or (exp_clean.startswith("[") and exp_clean.endswith("]")):
+            try:
+                import json
+                exp_data = json.loads(exp_clean) if isinstance(expected, str) else expected
+                actual_data = self.assertJsonOutput(result)
+                self.assertEqual(actual_data, exp_data, msg)
+                return
+            except Exception:
+                pass
+        actual_str = (result.stdout if isinstance(result, Result) else str(result)).strip()
+        self.assertEqual(actual_str, exp_clean, msg)
 '''
 
 
@@ -309,46 +359,40 @@ def build_smoke_args(
     request: str,
     project_name: str,
 ) -> Tuple[List[str], bool]:
-    """Construct a plausible argument list satisfying positionals and required flags."""
-    req_pos = contract.get("required_positionals", [])
-    req_lower = request.lower()
+    """Construct a plausible argument list satisfying positionals and required flags based on inferred input kind (R9-1)."""
+    kind = infer_tool_input_kind(request, contract, project_name=project_name)
+    fix_info = fixtures_for(kind)
 
-    is_toml = "toml" in req_lower or "toml" in project_name.lower() or "tomlget" in project_name.lower()
-    is_json = not is_toml and ("json" in req_lower or "json" in project_name.lower() or "jsonget" in project_name.lower())
-    is_csv = not is_toml and not is_json and ("csv" in req_lower or "csv" in project_name.lower() or "csvstats" in project_name.lower() or "colstats" in project_name.lower() or "tablefmt" in project_name.lower())
-    is_table = is_csv or any(k in req_lower for k in ("table", "column", "colstats", "align")) or "tablefmt" in project_name.lower()
-    is_dir = any(k in req_lower for k in ("folder", "directory", "subfolder")) or "dir" in project_name.lower() or "dupe" in project_name.lower()
+    is_table = (kind == "csv") or any(k in request.lower() for k in ("table", "column", "colstats", "align"))
 
-    if is_toml:
-        fix_file = fixture_dir / "tiny_valid.toml"
-        fix_file.write_text(
-            'title = "café"\n\n[server]\nhost = "localhost"\nports = [8080, 8081]\n\n[database]\nport = 5432\nenabled = true\n',
-            encoding="utf-8",
-        )
-    elif is_json:
-        fix_file = fixture_dir / "tiny_valid.json"
-        fix_file.write_text(
-            '{"users": [{"name": "Alice", "city": "Paris"}], "config": {"timeout": 30, "server": {"ports": [8080, 8081]}}, "data": null, "title": "café", "count": 42}',
-            encoding="utf-8",
-        )
-    elif is_csv:
-        fix_file = fixture_dir / "tiny_valid.csv"
-        fix_file.write_text(
-            "col_a,col_b,name\n10,20.5,apple\n30,40.0,café\n50,60.5,cherry\n",
-            encoding="utf-8",
-        )
-    elif is_dir:
-        fix_dir = fixture_dir / "tiny_dir"
+    if kind == "csv":
+        fix_file = fixture_dir / "sample.csv"
+        fix_file.write_text("col_a,col_b,name\n10,10.5,alpha\n20,20.5,beta\n30,30.0,gamma\n", encoding="utf-8")
+    elif kind == "multi_file":
+        f1 = fixture_dir / "f1.txt"
+        f2 = fixture_dir / "f2.txt"
+        f1.write_text("the quick brown fox jumps over the lazy dog and runs away\n", encoding="utf-8")
+        f2.write_text("short delta\n", encoding="utf-8")
+        fix_file = f1
+    elif kind == "folder/directory":
+        fix_dir = fixture_dir / "sample_dir"
         fix_dir.mkdir(parents=True, exist_ok=True)
         (fix_dir / "f1.txt").write_text("hello", encoding="utf-8")
         (fix_dir / "f2.txt").write_text("world", encoding="utf-8")
         fix_file = fix_dir
+    elif kind == "json":
+        fix_file = fixture_dir / "sample.json"
+        fix_file.write_text('{"users": [{"name": "Alice", "city": "Paris"}], "config": {"timeout": 30}}', encoding="utf-8")
+    elif kind == "toml/yaml/xml":
+        fix_file = fixture_dir / "sample.toml"
+        fix_file.write_text('title = "sample"\n[server]\nhost = "localhost"\nports = [8080, 8081]\n', encoding="utf-8")
     else:
-        fix_file = fixture_dir / "tiny_valid.txt"
-        fix_file.write_text("the quick brown fox\nthe quick brown dog\n", encoding="utf-8")
+        fix_file = fixture_dir / "sample.txt"
+        fix_file.write_text("hello world\nsecond line\n", encoding="utf-8")
 
     args: List[str] = []
     file_supplied = False
+    req_pos = contract.get("positionals", [])
 
     # Required options first if any
     for opt in contract.get("required_options", []):
@@ -400,48 +444,6 @@ def build_smoke_args(
             args.append("test")
 
     return args, True
-
-
-def check_table_alignment_output(output: str) -> Tuple[bool, str]:
-    """Deterministically verify table alignment:
-    Header row, separator row, and all data rows must share identical column separator positions,
-    and cell text must not exceed column width or cause overflow across header and data rows.
-    """
-    lines = [l.rstrip() for l in output.strip().splitlines() if l.strip()]
-    table_rows = [l for l in lines if "|" in l]
-    if len(table_rows) < 2:
-        return True, ""
-
-    header_seps = [i for i, ch in enumerate(table_rows[0]) if ch == "|"]
-    for r_idx, r in enumerate(table_rows[1:], 1):
-        row_seps = [i for i, ch in enumerate(r) if ch in ("|", "+")]
-        if row_seps != header_seps:
-            err = (
-                f"Table alignment error: row {r_idx} column separators at {row_seps} "
-                f"do not match header pipe indices at {header_seps}. Character position mismatch!\n"
-                f"Header: {table_rows[0]!r}\n"
-                f"Row {r_idx}: {r!r}\n"
-                "Column widths in Pass 1 MUST be computed from the TRUNCATED cell text "
-                "so header, separator, and all data rows align perfectly."
-            )
-            return False, err
-
-    # Header text vs data width comparison after truncation
-    if len(header_seps) >= 2:
-        for k in range(len(header_seps) - 1):
-            col_start = header_seps[k] + 1
-            col_end = header_seps[k + 1]
-            col_w = col_end - col_start
-            header_cell = table_rows[0][col_start:col_end].strip()
-            if len(header_cell) > col_w:
-                return False, f"Table alignment error: header cell '{header_cell}' exceeds column width ({col_w})"
-            for r_idx, r in enumerate(table_rows[2:], 2):
-                if len(r) > col_end:
-                    cell_text = r[col_start:col_end].strip()
-                    if len(cell_text) > col_w:
-                        return False, f"Table alignment error: row {r_idx} cell '{cell_text}' exceeds column width ({col_w})"
-
-    return True, ""
 
 
 def get_sha256(content_or_path: Any) -> str:
@@ -557,9 +559,11 @@ def run_smoke_tests(
 
     smoke_args, is_table = build_smoke_args(contract, smoke_fixture_dir, request, project_name)
     req_lower = request.lower()
-    is_toml = "toml" in req_lower or "toml" in project_name.lower() or "tomlget" in project_name.lower()
-    is_json = not is_toml and ("json" in req_lower or "json" in project_name.lower() or "jsonget" in project_name.lower())
-    is_csv = not is_toml and not is_json and ("csv" in req_lower or is_table)
+    kind = infer_tool_input_kind(request, contract, project_name=project_name)
+    is_csv = (kind == "csv")
+    is_table = is_csv or any(k in req_lower for k in ("table", "column", "colstats", "align"))
+    is_json = (kind == "json")
+    is_toml = (kind == "toml/yaml/xml")
 
     # 1. --help execution
     try:
@@ -800,8 +804,8 @@ def run_smoke_tests(
         except Exception as e:
             failures.append(f"Table standard alignment smoke test failed: {e}")
 
-        # 6b. Table alignment under --max-width 8
-        has_max_w = any(k in req_lower for k in ("max-width", "max_width", "truncate", "width")) or "--max-width" in request
+        # 6b. Table alignment under --max-width 8 (only if --max-width was requested)
+        has_max_w = "--max-width" in request or "--max_width" in request
         if has_max_w:
             try:
                 proc_mw = subprocess.run(
@@ -966,6 +970,7 @@ def build_standalone_project_staged(
     failing_tests: List[str] = []
     observed_samples: List[Dict[str, Any]] = []
     prev_tool_info: Optional[Tuple[str, str, Any]] = None
+    unrequested_fixed: bool = False
 
     while attempt < max_attempts:
         attempt += 1
@@ -989,8 +994,14 @@ def build_standalone_project_staged(
                 f"You are Helix, an expert software engineer building a clean, robust, standalone command-line Python utility named `{project_name}.py` "
                 f"fulfilling this user request:\n\"\"\"{request_text}\"\"\"\n\n"
                 "CRITICAL IMPLEMENTATION REQUIREMENTS:\n"
-                f"1. Implement all requested CLI options using argparse: {', '.join(flags) if flags else 'all options from request'}\n"
-                "2. Value Lookup & Sentinels (JSON / TOML / Dict keys):\n"
+                f"1. Implement only requested CLI options using argparse: {', '.join(flags) if flags else 'all options from request'}. Do NOT add unrequested CLI options.\n"
+                "2. Flag combinations & Spec fidelity (R9-2, R9-3):\n"
+                "   * Support every flag alone AND in all pairwise and multi-flag combinations! E.g. when `--json` is combined with filtering options (like `--column NAME` or `--min-words N`), the JSON output MUST respect those filters! Never ignore filter flags when `--json` is passed.\n"
+                "   * Strictly ignore non-requested/ignored items: if the request specifies ignoring empty cells or non-numeric columns, they MUST be completely omitted from BOTH plain-text table and JSON output.\n"
+                "   * In table mode, ensure all data rows, header rows, and total rows have the exact same number of column fields/pipes.\n"
+                "   * Selector validation (R10-4): When a selector option (`--column NAME`, key, field) names something missing or unusable (e.g. unknown column, non-numeric column when computing numeric statistics), print a clear error message to `sys.stderr` and exit non-zero (`sys.exit(1)`). Never exit 0 on an invalid or unusable selector.\n"
+                "   * Row-order semantics (R10-2): The Total/summary row must always be the LAST row (never first, never in middle) and must NEVER participate in sorting or filtering. In `--sort` mode, sort only data/file rows (largest first; preserve stable tie ordering). When `--min-words` is used, the Total row must equal the sum of the SHOWN rows.\n"
+                "3. Value Lookup & Sentinels (JSON / TOML / Dict keys):\n"
                 "   Use a sentinel object (e.g. `_MISSING = object()`) during lookup, NOT truthiness or `is None`.\n"
                 "   If a key exists and its value is `None`/`null`, it is a FOUND value: print `null` (or JSON null) and exit 0!\n"
                 "   Only if the key or index is genuinely NOT present in the object/array should you trigger `--default VALUE` (if provided) or exit with an error.\n"
@@ -1004,9 +1015,16 @@ def build_standalone_project_staged(
                 "   Pass 2: Re-open or seek to beginning and stream rows to print formatted rows.\n"
                 "   Peak memory usage must remain under 150 MB even on large 50+ MB inputs.\n"
                 "4. Robustness & Input Validation: If an input file/folder does not exist or cannot be accessed, print an error to sys.stderr and exit non-zero (sys.exit(1)). NEVER exit 0 on missing/invalid input paths. Normal `--help` must exit 0.\n"
-                "5. Table Formatting Specifications (if applicable):\n"
-                "   * In Pass 1, compute column widths AFTER applying `--max-width` truncation: `col_width = max(len(h), min(len(cell), max_width))`. All rows, headers, and separator lines must use identical column widths so `|` or `+` characters align vertically across all rows at identical character positions.\n"
-                "   * Continuous header separator line (e.g. `------+-----+---` or matching column dashes, never malformed like `-|-------+--------+---`).\n"
+                "5. Table Formatting Specifications (R10-1):\n"
+                "   * Column width = max of header and all printed cells AFTER number formatting. E.g. a float formatted with 6 decimal places (`6.666667`) has length 8, requiring column width at least 8. Never truncate or under-allocate columns.\n"
+                "   * In Pass 1, compute column widths AFTER formatting: all rows, headers, and separator lines must use identical column widths so `|` or `+` characters align vertically across all rows at identical character positions.\n"
+                "   * Continuous header separator line has exactly ONE segment per header column, matching column boundaries.\n"
+                "   * Standard aligned table printing pattern:\n"
+                "     header_line = ' | '.join(f'{h:<{w}}' for h, w in zip(headers, widths))\n"
+                "     sep_line = '-+-'.join('-' * w for w in widths)\n"
+                "     data_lines = [' | '.join(f'{str(c):<{w}}' for c, w in zip(row, widths)) for row in data_rows]\n"
+                "     print('\\n'.join([header_line, sep_line] + data_lines))\n"
+                "     CRITICAL: Join cells in each row with ' | '. NEVER use the separator line string as the join delimiter!\n"
                 "   * Cell truncation with `--max-width N`: keep a prefix of the string and append '...' such that total width is <= max-width (e.g. max-width 8 on long text becomes 'Hello...'). NEVER collapse everything into just '...'!\n"
                 "6. Windows Unicode Safety: At the top of main, configure stdout encoding:\n"
                 "   ```python\n"
@@ -1107,8 +1125,17 @@ def build_standalone_project_staged(
         observed_output = ""
         smoke_report = ""
         mem_report = ""
+        contract = discover_cli_contract(tool_path) if (tool_path and tool_path.exists()) else {}
 
         if tool_code:
+            # Check for unrequested CLI options (R9-3)
+            if not unrequested_fixed:
+                unreq = check_unrequested_cli_options(tool_code, request_text)
+                if unreq:
+                    unrequested_fixed = True
+                    _notify(f"Warning: unrequested CLI options detected ({', '.join(unreq)}). Asking fixer to remove them.", 62)
+                    (attempt_dir / "unrequested_options.txt").write_text(", ".join(unreq), encoding="utf-8")
+
             covered, missing_reqs = check_requirements_coverage(request_text, tool_code)
             if not covered:
                 _notify(f"Requirements coverage check failed: {missing_reqs}", 60)
@@ -1139,6 +1166,10 @@ def build_standalone_project_staged(
 
         # Stage 3: Generate tests grounded in observed behavior
         if tool_code and not test_code:
+            kind = infer_tool_input_kind(request_text, contract, tool_code, project_name)
+            fix_info = fixtures_for(kind)
+            fixtures_guide = fix_info.get("prompt_fixtures_summary", "")
+
             prompt = (
                 f"You are Helix, an expert software engineer.\n"
                 f"Write comprehensive unit tests in `test_{project_name}.py` verifying `{project_name}.py` against this user request:\n"
@@ -1151,18 +1182,22 @@ def build_standalone_project_staged(
                 "   from _scaffold import ToolTestCase\n"
                 f"   class Test{project_name.capitalize()}(ToolTestCase):\n"
                 "   ```\n"
-                "   Do NOT define your own `subprocess.run` helper or temp directory teardown. Use `self.run_tool(*args)` and `self.write_file(filename, content)` provided by `ToolTestCase`.\n"
+                "   Do NOT define your own `subprocess.run` helper or temp directory teardown. Use `self.run_tool(*args)` and scaffold helpers provided by `ToolTestCase`.\n"
                 "2. NO DIRECT SUBPROCESS: You must NOT invoke subprocess directly (`subprocess.run`, `Popen`, `call`) — all executions must use `self.run_tool(...)`.\n"
-                "3. TEST FIXTURES: Every test fixture path referenced in the test must be created via `self.write_file(...)` or `self.make_dir(...)`. Never rely on external disk state or arbitrary hard-coded paths.\n"
+                f"3. TEST FIXTURES FOR INFERRED INPUT KIND '{kind}':\n"
+                f"   Ready-made scaffold helpers provided by ToolTestCase: {', '.join(fix_info.get('ready_helpers', []))}\n"
+                f"{fixtures_guide}\n"
+                f"   CRITICAL: Never create .json fixtures if the tool is not a JSON tool, even if it has a --json output option! All input files MUST match kind '{kind}'.\n"
                 "4. REQUESTED OPTIONS COVERAGE: Ensure every option and flag requested by the user is exercised in at least one test method.\n"
-                "5. MEANINGFUL ASSERTIONS (NO TRIVIAL ASSERTIONS): Reject trivial assertions (e.g. `assertTrue(True)`, `assert 1 == 1`). Every test method must assert on `result.returncode`, `result.stdout`, or `result.stderr` specifically, using `self.assertOk(res)`, `self.assertFails(res)`, `self.assertIn(...)`, or `self.assertJsonOutput(res)`.\n"
-                "6. PARSING JSON: When testing `--json`, parse stdout with `data = self.assertJsonOutput(res)`.\n"
-                "7. ENTRY POINT GUARD: You MUST end the test file with the standard entry point:\n"
+                "5. MEANINGFUL ASSERTIONS & TEST PRECISION (R10-3): Reject trivial assertions. When asserting on table text output, assert that column names and numerical values are present in stdout (e.g. self.assertIn('col_a', res.stdout) and self.assertIn('20.0', res.stdout)). NEVER assert full multi-column formatted strings with pipes (e.g. 'col_a | 2 | 10.0') because padding spaces vary across implementations! For help tests, use self.assertIn('usage:', res.stdout.lower()). Never assert hardcoded character counts that are off by 1-2 chars (e.g. 58 vs 57, 100 vs 99). For floating-point statistics (mean, avg), format or round appropriately (e.g. `11.666667` or `self.assertAlmostEqual(..., delta=0.01)`) rather than rigid full-precision string comparisons like `'11.666666666666666'`. Every test method must assert on `result.returncode`, `result.stdout`, or `result.stderr` specifically, using `self.assertOk(res)`, `self.assertFails(res)`, `self.assertIn(...)`, or `self.assertJsonOutput(res)`.\n"
+                "6. SELECTOR VALIDATION TESTS (R10-4): When testing selector options like `--column NAME`, include tests asserting that an unknown column name or unusable/non-numeric column causes the tool to exit non-zero with error output: `self.assertFails(res)`.\n"
+                "7. PARSING JSON: When testing `--json`, remember that `--json` is an OUTPUT option. The input to the tool is still a valid fixture matching the tool's input kind. Parse stdout with `data = self.assertJsonOutput(res)`.\n"
+                "8. ENTRY POINT GUARD: You MUST end the test file with the standard entry point:\n"
                 "   ```python\n"
                 "   if __name__ == '__main__':\n"
                 "       unittest.main()\n"
                 "   ```\n"
-                f"8. Output ONLY the complete Python test code for `test_{project_name}.py` starting with `# FILE: test_{project_name}.py` inside a single ```python ``` code block. No explanations."
+                f"9. Output ONLY the complete Python test code for `test_{project_name}.py` inside a single ```python ``` code block. Do NOT include `# FILE:` headers, conversational text, or duplicated code blocks."
             )
             (attempt_dir / "tests_prompt.txt").write_text(prompt, encoding="utf-8")
             try:
@@ -1185,10 +1220,12 @@ def build_standalone_project_staged(
                             + f"\n\nPlease rewrite the complete test suite `test_{project_name}.py` fixing ALL violations:\n"
                             + "1. Import `ToolTestCase` from `_scaffold` and define a class inheriting from `ToolTestCase`.\n"
                             + "2. All tests MUST be methods (`def test_*(self):`) inside that class. Do NOT use bare module-level test functions.\n"
-                            + "3. Create all fixture files inside each test using `self.write_file(name, content)`.\n"
-                            + "4. Run the tool via `self.run_tool(*args)`. Do NOT call `subprocess` directly.\n"
-                            + "5. Ensure all necessary modules (e.g. `sys`, `json`) are explicitly imported at the top of the file.\n"
-                            + "6. Do NOT include `# FILE:` markers, comments naming the file, conversational prose, or markdown fences inside the code.\n"
+                            + f"3. Tool input kind is '{kind}'. Use matching fixture helpers:\n{fixtures_guide}\n"
+                            + f"   Do NOT create .json files if tool input kind is not JSON!\n"
+                            + "4. Create fixture files inside tests using `self.write_file(name, content)` or helpers like `self.csv_file(...)`.\n"
+                            + "5. Run the tool via `self.run_tool(*args)`. Do NOT call `subprocess` directly.\n"
+                            + "6. Ensure all necessary modules (e.g. `sys`, `json`) are explicitly imported at the top of the file.\n"
+                            + "7. Do NOT include `# FILE:` markers, comments naming the file, conversational prose, or markdown fences inside the code.\n"
                             + "Output ONLY the complete Python code in a single ```python ``` block."
                         )
                         try:
@@ -1423,6 +1460,15 @@ def build_standalone_project_staged(
 
         # Execute Fix Stage if attempts remain
         if attempt < max_attempts:
+            tool_kind = infer_tool_input_kind(request_text, contract, tool_code, project_name)
+            tool_fixtures_info = fixtures_for(tool_kind)
+            fix_fixtures_guide = tool_fixtures_info.get("prompt_guidance", "")
+
+            unreq_note = ""
+            unreq = check_unrequested_cli_options(tool_code, request_text)
+            if unreq:
+                unreq_note = f"\nCRITICAL SPEC FIDELITY: Remove unrequested CLI options ({', '.join(unreq)}). Only implement options explicitly requested by the user.\n"
+
             tool_lock_note = ""
             if lock_tool:
                 tool_lock_note = (
@@ -1438,25 +1484,40 @@ def build_standalone_project_staged(
                     f"{tool_lock_note}"
                     f"CURRENT TOOL CODE (`{project_name}.py`):\n```python\n{tool_code}\n```\n\n"
                     f"FAILING TEST TRACEBACKS:\n{last_error}\n\n"
+                    f"FIXTURE AND INPUT KIND GUIDANCE:\n{fix_fixtures_guide}\n\n"
                     "INSTRUCTIONS:\n"
-                    f"1. Regenerate `test_{project_name}.py` from scratch to test the tool properly according to user requirements.\n"
-                    f"2. Tool execution must use `sys.executable` with `TOOL_PATH = Path(__file__).resolve().parent / '{project_name}.py'`.\n"
-                    "3. Every `subprocess.run` call must pass `encoding='utf-8', errors='replace'`.\n"
-                    "4. Bad/empty input tests must assert `returncode != 0`.\n"
-                    f"5. Output ONLY the complete Python test code starting with `# FILE: test_{project_name}.py` inside a single ```python ``` code block."
+                    f"1. Regenerate `test_{project_name}.py` from scratch inheriting from `ToolTestCase` in `_scaffold`.\n"
+                    "2. Run the tool via `self.run_tool(*args)`. Do NOT call `subprocess` directly.\n"
+                    f"3. Create input fixtures matching input kind '{tool_kind}' using scaffold helpers (e.g. self.csv_file, self.text_file, self.json_file, self.folder) or self.write_file. NEVER create .json fixtures for a non-JSON input kind!\n"
+                    "4. Bad/empty input tests must assert `returncode != 0` via `self.assertFails(res)`.\n"
+                    "5. Parse `--json` output with `data = self.assertJsonOutput(res)` and assert on data structures. NEVER match raw JSON string literals!\n"
+                    "6. When asserting on table text output, assert that column names and numerical values are present in stdout (e.g. `self.assertIn('col_a', res.stdout)`). Do NOT assert full multi-column formatted strings with pipes.\n"
+                    "7. Ensure tests exercise every option requested: " + (", ".join([f for opt in contract.get("optional_options", []) for f in opt.get("flags", [])]) if contract and isinstance(contract, dict) and contract.get("optional_options") else "all requested options") + ".\n"
+                    f"8. Output ONLY the complete Python test code for `test_{project_name}.py` inside a single ```python ``` code block. Do NOT include `# FILE:` headers or conversational prose."
                 )
             elif fix_stage == "regenerate_tool_only":
                 prompt = (
                     f"The test suite for `{project_name}.py` expresses the required behavior, but the tool failed tests or reference oracles.\n\n"
                     f"USER REQUIREMENTS:\n\"\"\"{request_text}\"\"\"\n\n"
+                    f"{unreq_note}"
                     f"CURRENT TEST CODE (`test_{project_name}.py`):\n```python\n{test_code}\n```\n\n"
                     f"FAILING TRACEBACKS / ORACLE DEFECTS:\n{last_error}\n\n"
                     "INSTRUCTIONS:\n"
                     f"1. Regenerate `{project_name}.py` in full so it satisfies all user requirements and passes the tests.\n"
-                    "2. Numeric parsing: never use `str.isdigit()` or regex for numeric checks; use `float(cell.strip())` inside `try...except (ValueError, TypeError)` block (accepts negatives, decimals, exponents; skip empty cells).\n"
-                    "3. Multi-column streaming: accumulate all columns in a single pass over rows. Never iterate over the reader once per column, and never consume an iterator and reuse it.\n"
-                    "4. Keep all CLI flags, chunked streaming, Windows UTF-8 stdout configuration, and non-zero exit on errors.\n"
-                    f"5. Output ONLY the complete Python code starting with `# FILE: {project_name}.py` inside a single ```python ``` code block."
+                    "2. Flag combinations & Spec fidelity (R9-2, R9-3):\n"
+                    "   * Respect every flag in isolation and in all pairwise / multi-flag combinations! E.g. if `--column NAME` is passed together with `--json`, output JSON containing ONLY that column! Never ignore `--column` in `--json` mode.\n"
+                    "   * Strictly ignore non-requested elements: if the user specifies ignoring non-numeric columns, non-numeric columns must NOT appear anywhere in the output table OR the output JSON.\n"
+                    "   * In table mode, ensure all data rows, header rows, and total rows have the exact same number of column fields.\n"
+                    "   * Standard aligned table printing pattern:\n"
+                    "     header_line = ' | '.join(f'{h:<{w}}' for h, w in zip(headers, widths))\n"
+                    "     sep_line = '-+-'.join('-' * w for w in widths) # or matching dashes\n"
+                    "     data_lines = [' | '.join(f'{str(c):<{w}}' for c, w in zip(row, widths)) for row in data_rows]\n"
+                    "     print('\\n'.join([header_line, sep_line] + data_lines))\n"
+                    "     CRITICAL: Join cells in each row with ' | '. NEVER use the separator line string as the join delimiter!\n"
+                    "3. Numeric parsing: never use `str.isdigit()` or regex for numeric checks; use `float(cell.strip())` inside `try...except (ValueError, TypeError)` block (accepts negatives, decimals, exponents; skip empty cells).\n"
+                    "4. Multi-column streaming: accumulate all columns in a single pass over rows. Never iterate over the reader once per column, and never consume an iterator and reuse it.\n"
+                    "5. Keep all CLI flags, chunked streaming, Windows UTF-8 stdout configuration, and non-zero exit on errors.\n"
+                    f"6. Output ONLY the complete Python code starting with `# FILE: {project_name}.py` inside a single ```python ``` code block."
                 )
             elif fix_stage == "minimal_diff_targeted_fix":
                 prompt = (
@@ -1466,8 +1527,10 @@ def build_standalone_project_staged(
                     f"FAILING TRACEBACK:\n{last_error[:1000]}\n\n"
                     f"CURRENT TOOL CODE (`{project_name}.py`):\n```python\n{tool_code}\n```\n\n"
                     f"CURRENT TEST CODE (`test_{project_name}.py`):\n```python\n{test_code}\n```\n\n"
+                    f"FIXTURE AND INPUT KIND GUIDANCE:\n{fix_fixtures_guide}\n\n"
                     "Provide the complete corrected file for whichever file needs the fix (or both). "
-                    f"Label each code block with `# FILE: {project_name}.py` or `# FILE: test_{project_name}.py`."
+                    f"Label each code block with `# FILE: {project_name}.py` or `# FILE: test_{project_name}.py`.\n"
+                    f"If fixing tests: inherit from `ToolTestCase` in `_scaffold`, run tool via `self.run_tool(*args)`, and all input fixtures must match '{tool_kind}'."
                 )
             else:
                 prompt = (
@@ -1477,10 +1540,12 @@ def build_standalone_project_staged(
                     f"FAILING TRACEBACK:\n{last_error[:1000]}\n\n"
                     f"CURRENT TOOL CODE (`{project_name}.py`):\n```python\n{tool_code}\n```\n\n"
                     f"CURRENT TEST CODE (`test_{project_name}.py`):\n```python\n{test_code}\n```\n\n"
+                    f"FIXTURE AND INPUT KIND GUIDANCE:\n{fix_fixtures_guide}\n\n"
                     "DIAGNOSIS & FIX INSTRUCTIONS:\n"
                     "1. Decide whether the TEST is wrong or the TOOL is wrong against user requirements:\n"
                     "   - If the tool behaves correctly according to requirements but the test asserts an incorrect expectation, fix test code.\n"
-                    "   - If the tool crashes, produces wrong calculations, or violates requirements (e.g. exits 0 on nonexistent path), fix tool code.\n"
+                    "   - If the tool crashes, produces wrong calculations, ignores flag combinations (e.g. `--column` with `--json`), or violates requirements, fix tool code.\n"
+                    "   - If fixing tests: inherit from `ToolTestCase` in `_scaffold`, run tool via `self.run_tool(*args)`, and all fixtures must match '{tool_kind}'.\n"
                     "   - If both have issues, fix both.\n"
                     "2. Return ONLY the corrected file(s) in full. Each file MUST start with a header comment identifying the file:\n"
                     f"   # FILE: {project_name}.py\n"
