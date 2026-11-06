@@ -24,6 +24,8 @@ from ogun_core.config import SYSTEM_PROMPT, get_request_timeout
 from ogun_core.engine import CoreEngine
 from ogun_core.paths import OGUN_ROOT
 from ogun_core.quality import (
+    emphasize_required_fixes,
+    tests_only_use_verified_flags,
     BuildStatus,
     OracleRegistry,
     ParsedUnittestSummary,
@@ -1251,6 +1253,57 @@ def help_lists_options(tool_path: Path, flags: List[str], timeout: float = 20.0)
     return [f for f in flags if f not in out]
 
 
+def regression_diffs(old_tool: Path, new_tool: Path, request: str, cwd: Path,
+                     oracle_checked: Optional[Set[str]] = None) -> List[str]:
+    """Run the pre-update and post-update tool in every mode the ORIGINAL request had (default and each on/off flag
+    listed by the old --help) on the same small input; return the modes whose output changed. An update must not
+    change existing behaviour (live bug: adding --precision also added internal fields to --json output)."""
+    # Modes an oracle verifies are checked against correct values instead: an update may legitimately FIX them
+    # (e.g. stop leaking internal fields), so only unverified modes must stay byte-identical.
+    import tempfile
+    td = Path(tempfile.mkdtemp(prefix="regress_"))
+    try:
+        low = (request or "").lower()
+        if "csv" in low:
+            f = td / "data.csv"
+            f.write_text("col_a,col_b,name\n10,10.5,alpha\n20,20.5,beta\n30,30.0,gamma\n", encoding="utf-8")
+            inputs = [str(f)]
+        else:
+            a, b = td / "a.txt", td / "b.txt"
+            a.write_text("one two three\nfour five\n", encoding="utf-8")
+            b.write_text("six\n", encoding="utf-8")
+            inputs = [str(a), str(b)]
+        help_out = subprocess.run([sys.executable, str(old_tool), "--help"], capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=20).stdout
+        switches = sorted({m.group(1) for m in re.finditer(r"(--[\w-]+)(?![ =][A-Z_])", help_out)} - {"--help"})
+        diffs = []
+        checked = oracle_checked if oracle_checked is not None else set()
+        modes = ([] if oracle_checked is not None else [[]]) + [[s] for s in switches if s not in checked]
+        for extra in modes:
+            outs = []
+            for tool in (old_tool, new_tool):
+                p = subprocess.run([sys.executable, str(tool), *inputs, *extra], cwd=str(td), capture_output=True,
+                                   text=True, encoding="utf-8", errors="replace", timeout=20,
+                                   env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                outs.append((p.returncode, p.stdout.replace(str(td), "")))
+            if outs[0] != outs[1]:
+                diffs.append(" ".join(extra) or "default mode")
+        return diffs
+    except Exception:
+        return []
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def new_options_without_tests(test_path: Path, flags: List[str]) -> List[str]:
+    """New options that no test actually passes to the tool (a passing suite says nothing about an option it never runs)."""
+    try:
+        code = Path(test_path).read_text(encoding="utf-8")
+    except Exception:
+        return list(flags)
+    return [f for f in flags if not re.search(r"(?<![\w-])" + re.escape(f) + r"(?![\w-])", code)]
+
+
 def _restore_pre_update(project_dir: Path, project_name: str, backup_dir: Optional[Path]) -> str:
     """Put the tool and its tests back exactly as they were before a failed update (a failed update must never leave
     the user with a changed tool or no test file). Returns a short note."""
@@ -1262,6 +1315,10 @@ def _restore_pre_update(project_dir: Path, project_name: str, backup_dir: Option
         if src.exists():
             shutil.copy2(src, project_dir / fname)
             restored.append(fname)
+    # the build rewrote .build_log/request.txt with the combined request; put the original back so the next update
+    # (and the oracles) see what the tool really does
+    if (backup_dir / "request.txt").exists():
+        shutil.copy2(backup_dir / "request.txt", project_dir / ".build_log" / "request.txt")
     return f"Restored the previous {' and '.join(restored)} (backup kept in {backup_dir.name})." if restored else ""
 
 
@@ -1293,12 +1350,32 @@ def update_standalone_project(
     backup_dir = project_dir / ".build_log" / f"pre_update_{time.strftime('%Y%m%d-%H%M%S')}"
     backup_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(tool_path, backup_dir / tool_path.name)
+    if (project_dir / ".build_log" / "request.txt").exists():
+        shutil.copy2(project_dir / ".build_log" / "request.txt", backup_dir / "request.txt")
     if test_path.exists():
         shutil.move(str(test_path), str(backup_dir / test_path.name))
     success, msg, details = (build_fn or build_standalone_project_staged)(engine, combined, max_attempts=max_attempts,
                                                                           on_progress=on_progress)
     new_flags = sorted(set(extract_requested_flags(change_request)) - set(extract_requested_flags(original)))
     missing = help_lists_options(tool_path, new_flags) if new_flags and tool_path.exists() else []
+    if not missing and new_flags and success:
+        from ogun_core.quality import oracle_verified_flags
+        changed = regression_diffs(backup_dir / tool_path.name, tool_path, original, project_dir,
+                                   oracle_checked=oracle_verified_flags(original))
+        if changed:
+            note = (f"Update of `{project_name}` NOT accepted: it changed output that already worked in "
+                    f"{', '.join(changed)}.")
+            details = dict(details or {})
+            details.update(status="failed", error=note)
+            success, msg = False, f"{note}\n\n{msg}"
+        checked = oracle_verified_flags(combined) or set()
+        untested = [f for f in new_options_without_tests(test_path, new_flags) if f not in checked] if success else []
+        if untested:
+            note = (f"Update of `{project_name}` NOT confirmed: {', '.join(untested)} exists but no test runs it, so its "
+                    "behaviour is unchecked.")
+            details = dict(details or {})
+            details.update(status="failed", error=note)
+            success, msg = False, f"{note}\n\n{msg}"
     if missing:
         note = f"Update of `{project_name}` NOT done: {', '.join(missing)} is not an option of the tool (checked with --help)."
         details = dict(details or {})
@@ -1311,7 +1388,22 @@ def update_standalone_project(
     return success, msg, details
 
 
-def build_standalone_project_staged(
+def build_standalone_project_staged(*args: Any, **kwargs: Any) -> Tuple[bool, str, Dict[str, Any]]:
+    """Run a build, then delete the ~50 MB memory-check fixture it cached under .build_log/ (it is reused across the
+    attempts of one build, but leaving it behind made every delivered project 40-50 MB)."""
+    try:
+        return _build_standalone_project_staged_impl(*args, **kwargs)
+    finally:
+        try:
+            _req = kwargs.get("request_text") if "request_text" in kwargs else next((a for a in args if isinstance(a, str)), "")
+            _name = extract_project_name(_req) if _req else ""
+            if _name:
+                shutil.rmtree(WORKSPACE_DIR / _name / ".build_log" / "_memory_fixture", ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _build_standalone_project_staged_impl(
     engine: CoreEngine,
     request_text: str,
     max_attempts: int = 5,
@@ -1742,7 +1834,10 @@ def build_standalone_project_staged(
                     break
                 if attempt >= max_attempts:
                     break
-                continue
+                # Do NOT skip to the next attempt: a tool that is missing a requested option (coverage /
+                # smoke / oracle failure) must still reach the fix stage. Live bug: three test-writing
+                # timeouts in a row meant --top was never added and the update failed.
+                test_code = ""
 
         # Stage 4: Run tests via unittest module discovery and direct execution (R7-1, R11-1, R11-2)
         passed = False
@@ -1773,7 +1868,7 @@ def build_standalone_project_staged(
 
             # R11-1: Deterministic observed-output test repair (Run BEFORE strategy rotation and before quarantine)
             if not passed and failing_tests:
-                _tool_verified = bool(smoke_ok and OracleRegistry.applicable_oracles(request_text))
+                _tool_verified = bool(smoke_ok and tests_only_use_verified_flags(test_code, failing_tests, request_text, allow_help_only=False))
                 rep_ok, rep_code = repair_observed_output_test_defects(test_code, test_res_str, tool_verified=_tool_verified)
                 if rep_ok:
                     try:
@@ -2039,6 +2134,7 @@ def build_standalone_project_staged(
                 fix_opts = {**runtime_model_opts, "num_predict": 1500}
                 if no_op_streak > 0:
                     fix_opts["temperature"] = min(0.3 + 0.2 * no_op_streak, 0.9)
+                prompt = emphasize_required_fixes(prompt, last_error)
                 reply = _chat_with_options(engine.client, [{"role": "user", "content": prompt}], options=fix_opts)
                 raw_content = reply.get("content", "")
                 (attempt_dir / "fix_raw.txt").write_text(raw_content, encoding="utf-8")
@@ -2247,9 +2343,16 @@ def build_standalone_project_staged(
     if tool_meets_requirements and failing_tests:
         can_quarantine = defect_type == "TEST" or lock_tool or any(k in test_res_str for k in ("AssertionError", "assertNotIn", "1 != 3", "json"))
         if can_quarantine:
-            quar_ok, quar_list = quarantine_bad_tests(
-                project_dir, test_path, failing_tests, test_output=test_res_str, observed_samples=observed_samples, request=request_text
-            )
+            try:
+                _cur_tests = test_path.read_text(encoding="utf-8")
+            except Exception:
+                _cur_tests = ""
+            # Only tests of independently verified options may be skipped as "wrong"; a failing test of any other
+            # option (e.g. a newly requested --precision) is evidence that the TOOL is wrong and must stay failing.
+            _skippable = [t for t in failing_tests if tests_only_use_verified_flags(_cur_tests, [t], request_text)]
+            quar_ok, quar_list = (quarantine_bad_tests(
+                project_dir, test_path, _skippable, test_output=test_res_str, observed_samples=observed_samples, request=request_text
+            ) if _skippable else (False, []))
             if quar_ok:
                 re_output = run_python_test(str(test_path), base_dir=project_dir)
                 re_failing = re.findall(r"(?:FAIL|ERROR):\s+([a-zA-Z0-9_]+)", re_output)

@@ -485,7 +485,9 @@ class CoreEngine:
 
         # A request to CHANGE an existing workspace tool or plugin updates it instead of starting something new.
         from ogun_core.standalone_builder import detect_change_target
-        _target = None if clean_user in continuation_words else detect_change_target(effective_user_text)
+        # (No routing while a plugin build is running: its own prompts mention the plugin and must reach the model.)
+        _target = None if (clean_user in continuation_words or getattr(self, "_plugin_build_active", False)) \
+            else detect_change_target(effective_user_text)
         if _target and _target[0] == "workspace_tool":
             from ogun_core.standalone_builder import update_standalone_project
             try:
@@ -510,16 +512,34 @@ class CoreEngine:
                 _ptest = (PLUGINS_TESTS_DIR / f"test_{_pname}.py").read_text(encoding="utf-8")
             except Exception:
                 _ptest = "(no existing test file)"
-            effective_user_text = (
-                f"UPDATE your existing plugin `{_pname}`. Call `create_plugin` with name=\"{_pname}\" (exactly this name, so "
-                "the plugin is replaced, not duplicated), the COMPLETE updated code and the COMPLETE updated test code. "
-                "Start from the current code below, keep what works and apply only the requested change. The test must "
-                "compute expected values with real code (e.g. the same standard-library call on its own input), never "
-                "hand-calculated constants.\n\n"
+            # Live bug: asking the chat model to call create_plugin itself ran 10 rounds without ever calling it.
+            # The staged plugin builder (write -> test -> mount, with failure feedback) does the update instead.
+            update_request = (
+                f"UPDATE the existing plugin `{_pname}` (keep `name: str = \"{_pname}\"`). Start from its current code "
+                "below, keep everything that works and apply only the requested change. Output the COMPLETE updated "
+                "tool code and the COMPLETE updated test.\n\n"
                 f"=== CURRENT plugins/custom_tools/{_pname}.py ===\n{_pcode}\n"
                 f"=== CURRENT plugins/tests/test_{_pname}.py ===\n{_ptest}\n"
                 f"=== REQUESTED CHANGE ===\n{user_text}\n=== END ==="
             )
+            from ogun_core.plugin_builder import build_plugin_staged
+            self._plugin_build_active = True
+            saved_messages = list(self.messages)
+            try:
+                ok, final_msg, _ = build_plugin_staged(self, self.plugin_manager, update_request, force_name=_pname)
+            except TimeoutError:
+                ok, final_msg = False, f"Model request timed out while updating the '{_pname}' plugin; it was not changed."
+            finally:
+                self._plugin_build_active = False
+                self.messages = saved_messages
+            if not ok:
+                final_msg = (f"The '{_pname}' plugin was NOT updated; its previous working version is unchanged.\n\n"
+                             f"{final_msg}")
+            self.last_turn_status = {"status": "success" if ok else "failed", "task": user_text,
+                                     "error": "" if ok else final_msg[:300]}
+            self.messages.append({"role": "user", "content": user_text})
+            self.messages.append({"role": "assistant", "content": final_msg})
+            return final_msg
 
         # Check if standalone CLI project request
         from ogun_core.quality import classify_project_request

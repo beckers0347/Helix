@@ -25,6 +25,7 @@ def build_plugin_staged(
     plugin_manager: PluginManager,
     request_text: str,
     max_attempts: int = 3,
+    force_name: Optional[str] = None,
 ) -> Tuple[bool, str, Optional[str]]:
     """Build, test, verify, and register a dynamic plugin in stages with self-correction.
 
@@ -98,6 +99,8 @@ def build_plugin_staged(
         # Extract plugin name
         name_match = re.search(r'name\s*:\s*str\s*=\s*["\']([^"\']+)["\']', tool_code)
         plugin_name = name_match.group(1) if name_match else "custom_tool"
+        if force_name:
+            plugin_name = force_name   # an update must replace the existing plugin, never create a differently named one
 
         # Attempt creation and isolated subprocess testing
         res = plugin_manager.create_or_update_plugin(plugin_name, tool_code, test_code)

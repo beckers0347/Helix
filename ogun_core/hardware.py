@@ -947,13 +947,13 @@ def auto_configure(
             source="estimate",
         )
 
-    # 2. Reserve calculation (1.5 - 2.0 GB default for display / background apps)
+    # 2. Safety margin taken from FREE VRAM. Free VRAM already excludes the desktop and every running program, so a
+    # large reserve double-counts them: 2.0 GB left the 14b model at 40/49 layers on a 12 GB GPU with 10.7 GB free
+    # (~16 tok/s instead of ~54 all-GPU), and builder calls hit their timeout. Ollama alone fits the whole model there.
     if "reserve_gb" in overrides:
         reserve_gb = max(0.0, float(overrides["reserve_gb"]))
-    elif hw.gpu and round(hw.gpu.vram_total_gb, 0) >= 12.0:
-        reserve_gb = 2.0
     else:
-        reserve_gb = 1.5
+        reserve_gb = 0.5
 
     # 3. Context window tuning (default 8192, 4096 <= num_ctx <= 16384, step 1024)
     if "ctx" in overrides:

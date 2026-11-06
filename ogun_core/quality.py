@@ -520,6 +520,174 @@ class AssertionLiteralUpdater(ast.NodeTransformer):
         return node
 
 
+_PRECISION_FLAG_RE = re.compile(r"(--(?:precision|decimals|decimal-places|places|digits|round))\b", re.I)
+_TOP_FLAG_RE = re.compile(r"(--(?:top|limit|head|max-files))\b[^.]*?\b(most|largest|highest|biggest|top)\b", re.I | re.S)
+
+
+def _run_tool(tool_path: Path, args: List[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(tool_path), *args], cwd=str(cwd), capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=20.0,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+
+
+def check_precision_option(tool_path: Path, request: str, project_dir: Path, csv_file: Path) -> Tuple[bool, str]:
+    """If the request has a decimal-places option, `<flag> 3` must print every requested statistic (min / max /
+    mean, as named in the request) with exactly 3 decimals and `<flag> 0` with none. Live bug: --precision changed
+    only the mean, and nothing caught it."""
+    m = _PRECISION_FLAG_RE.search(request or "")
+    if not m:
+        return True, ""
+    flag = m.group(1).lower()
+    low = request.lower()
+    named = [s for s, words in (("min", ("min", "minimum")), ("max", ("max", "maximum")), ("mean", ("mean", "average")))
+             if any(re.search(rf"\b{w}\b", low) for w in words)] or ["min", "max", "mean"]
+    for places in (3, 0):
+        proc = _run_tool(tool_path, [str(csv_file), flag, str(places)], project_dir)
+        if proc.returncode != 0:
+            return False, f"{flag} {places} failed with code {proc.returncode}: {proc.stderr[:200]}"
+        rows = [[c.strip() for c in ln.split("|")] for ln in proc.stdout.splitlines() if "|" in ln]
+        if not rows:
+            return False, f"{flag} {places}: no table output to check: {proc.stdout[:200]}"
+        header = [h.lower() for h in rows[0]]
+        idx = {}
+        for stat in named:
+            for i, h in enumerate(header):
+                if h == stat or h.startswith(stat):
+                    idx[stat] = i
+                    break
+        if not idx:
+            return False, f"{flag} {places}: table header has no min/max/mean columns: {rows[0]}"
+        pattern = re.compile(r"^-?\d+\.\d{%d}$" % places) if places else re.compile(r"^-?\d+$")
+        for row in rows[1:]:
+            if not any(c in ("col_a", "col_b") for c in row):
+                continue
+            for stat, i in idx.items():
+                cell = row[i] if i < len(row) else ""
+                if not pattern.match(cell):
+                    return False, (f"{flag} {places} must show {stat} with exactly {places} decimal place(s); "
+                                   f"row {row[0]!r} shows {cell!r}. HOW TO FIX: format min, max AND mean the same way "
+                                   f"in the table, e.g. f\"{{value:.{{args.{flag.lstrip('-').replace('-', '_')}}}f}}\" "
+                                   f"(with 0 decimal places the value prints with no decimal point); count stays an integer.")
+    return True, ""
+
+
+def check_top_n_option(tool_path: Path, request: str, project_dir: Path, files: List[Path],
+                       words: Dict[str, int]) -> Tuple[bool, str]:
+    """If the request has a top-N option ('--top N ... most words'), `<flag> 1` / `<flag> 2` must list exactly the
+    1 / 2 files with the most words, whatever order the files were given in. Live bug: --top kept the FIRST N files."""
+    m = _TOP_FLAG_RE.search(request or "")
+    if not m:
+        return True, ""
+    flag = m.group(1).lower()
+    ranked = sorted(words, key=lambda k: -words[k])
+    modes = [[]] + ([["--json"]] if "--json" in request else [])
+    for n in (1, 2):
+        expect, absent = set(ranked[:n]), set(ranked[n:])
+        for extra in modes:
+            proc = _run_tool(tool_path, [*map(str, files), flag, str(n), *extra], project_dir)
+            if proc.returncode != 0:
+                return False, f"{flag} {n} {' '.join(extra)} failed with code {proc.returncode}: {proc.stderr[:200]}"
+            shown = {k for k in words if re.search(rf"\b{k}\.txt\b", proc.stdout)}
+            if shown != expect:
+                return False, (f"{flag} {n} {' '.join(extra)} must show only {sorted(expect)} (the {n} file(s) with the "
+                               f"most words) but showed {sorted(shown)}. HOW TO FIX: when {flag} is given, first sort the "
+                               f"per-file results by word count, largest first (sorted(results, key=lambda r: r['words'], "
+                               f"reverse=True)), THEN keep the first N; do this before printing in BOTH table and --json "
+                               f"mode. Do not just slice the files in the order they were given.")
+    return True, ""
+
+
+def option_flags_checked_by_oracles(request: str) -> Set[str]:
+    """Extra options whose BEHAVIOUR the oracles check when the request has them (top-N, decimal places)."""
+    flags: Set[str] = set()
+    m = _PRECISION_FLAG_RE.search(request or "")
+    if m:
+        flags.add(m.group(1).lower())
+    m = _TOP_FLAG_RE.search(request or "")
+    if m:
+        flags.add(m.group(1).lower())
+    return flags
+
+
+# Options each reference oracle actually runs and checks against independently computed values.
+ORACLE_VERIFIED_FLAGS: Dict[str, Set[str]] = {
+    "csv_column_stats": {"--column", "--delimiter", "--json"},
+    "line_word_count": {"--json", "--min-words", "--sort"},
+    "dotted_path_lookup": set(),
+}
+
+
+def oracle_verified_flags(request: str) -> Optional[Set[str]]:
+    """Options independently verified for this request (default mode included), or None when no oracle applies."""
+    names = OracleRegistry.applicable_oracles(request)
+    if not names:
+        return None
+    flags: Set[str] = set()
+    for n in names:
+        flags |= ORACLE_VERIFIED_FLAGS.get(n, set())
+    return flags | option_flags_checked_by_oracles(request)
+
+
+def test_method_flags(test_code: str, test_name: str) -> Optional[Set[str]]:
+    """Command-line options used inside one test method (None if the method cannot be found)."""
+    m = re.search(rf"def\s+{re.escape(test_name)}\s*\([^)]*\):(.*?)(?=\n[ \t]*def\s|\n[ \t]*class\s|\Z)",
+                  test_code or "", re.S)
+    if not m:
+        return None
+    return set(re.findall(r"(?<![\w-])--[A-Za-z][\w-]*", m.group(1)))
+
+
+def tests_only_use_verified_flags(test_code: str, test_names: List[str], request: str,
+                                  allow_help_only: bool = True) -> bool:
+    """True when every named failing test exercises only oracle-verified options.
+
+    Live bugs: a correct test of a NEW option (--top) was skipped as "wrong", so a tool that kept the first N files
+    instead of the N largest was delivered as PASSED WITH SKIPS; the same reasoning could have "corrected" a test of
+    --precision, which no oracle checks. A test of an unverified option is evidence about the tool, never skipped or
+    rewritten to match the tool's output.
+    """
+    if not test_names:
+        return False
+    verified = oracle_verified_flags(request)
+    # --help is run by every smoke test and its exact wording is not a correctness property, so a test that only
+    # checks --help text may always be judged against the observed output.
+    always = {"--help", "-h"}
+    for name in test_names:
+        used = test_method_flags(test_code, name)
+        if used is None:
+            return False
+        if allow_help_only and used and used <= always:
+            continue
+        if verified is None or not (used - always) <= verified:
+            return False
+    return True
+
+
+def emphasize_required_fixes(prompt: str, feedback: str) -> str:
+    """Put every failure that carries a concrete 'HOW TO FIX' near the TOP of a fix prompt and again at the END.
+
+    Live bug: the oracle's exact fix for --top ("sort by words, largest first, THEN keep N") sat on line ~257 of a
+    17 KB fix prompt; the 14b model returned the same `results[:args.top]` and the loop guard stopped the build.
+    """
+    items = []
+    for line in (feedback or "").splitlines():
+        line = line.strip().lstrip("- ").strip()
+        if "HOW TO FIX" in line and line not in items:
+            items.append(line)
+    if not items or "REQUIRED CHANGES" in (prompt or ""):
+        return prompt
+    block = ("REQUIRED CHANGES (the tool is WRONG until every one of these is fixed; apply each HOW TO FIX exactly):\n"
+             + "\n".join(f"{i}. {t}" for i, t in enumerate(items, 1)) + "\n")
+    lines = prompt.split("\n")
+    at = next((i for i, l in enumerate(lines) if l.startswith("STAGE:")), None)
+    if at is None:
+        head = block + "\n" + prompt
+    else:
+        head = "\n".join(lines[:at + 1] + [block] + lines[at + 1:])
+    return head.rstrip() + "\n\nBEFORE YOU ANSWER, re-check the REQUIRED CHANGES:\n" + "\n".join(
+        f"{i}. {t}" for i, t in enumerate(items, 1)) + "\n"
+
+
 def repair_observed_output_test_defects(test_code: str, test_output: str, tool_verified: bool = False) -> Tuple[bool, str]:
     """Deterministically repair test assertions when the tool's observed output is proven right (R10-3, R11-1).
     Extracts mismatch assertions (57 vs 58, 99 vs 100, 88 vs 89, 11.666666666666666 vs 11.666667)
@@ -1520,12 +1688,8 @@ def sanitize_test_code(code: str, project_name: str) -> str:
         code
     )
 
-    # Sanitize fragile exact error-sentence assertions on stderr
-    code = re.sub(
-        r"self\.assertIn\(\s*['\"][^'\"]{15,}['\"]\s*,\s*((?:res|result|proc|out|r)\.stderr[^)]*)\)",
-        r"self.assertTrue(len(\1.strip()) > 0)",
-        code
-    )
+    # (Removed: rewriting every error-message assertion on stderr to "stderr is not empty" made tests unable to catch
+    # a tool printing the wrong error, e.g. for an unknown column. Error messages are checked as written.)
 
     # Sanitize fragile exact separator line assertions (e.g. '-------+-------+-----+-----+-----')
     code = re.sub(
@@ -3163,6 +3327,18 @@ class OracleRegistry:
                 if "name" in data or "col_c" in data:
                     return False, f"Spec fidelity violation: non-numeric column appeared in JSON output (request specifies ignoring non-numeric columns): {list(data.keys())}"
 
+                # Each column holds exactly the requested statistics: internal accumulators (sum, flags) must not leak
+                # into the output (live bug: an update added "sum" and "non_numeric_seen" to every column).
+                _wanted = {"count", "min", "max", "mean"} | {k for k in ("sum", "median", "stddev", "std", "variance", "range", "mode")
+                                                             if re.search(rf"\b{k}\b", request.lower())}
+                for _cn in ("col_a", "col_b"):
+                    _keys = set(data[_cn].keys()) if isinstance(data.get(_cn), dict) else set()
+                    if _keys != _wanted:
+                        return False, (f"JSON stats for {_cn} must contain exactly {sorted(_wanted)}, got {sorted(_keys)} "
+                                       "(do not output internal fields). HOW TO FIX: keep sums and flags in a separate "
+                                       "accumulator and build the output dict per column with ONLY "
+                                       f"{sorted(_wanted)} just before printing.")
+
                 # 5. --column col_a --json (Pair: filter + output format - R9-2)
                 if "--column" in request:
                     proc_cj = subprocess.run(
@@ -3294,6 +3470,11 @@ class OracleRegistry:
                     return False, f"Selector validation defect (R11-3): tool raised unhandled traceback on non-numeric column '--column name': {err_nonnum[:300]}"
                 if not err_nonnum.strip() and "error" not in out_nonnum.lower():
                     return False, "Selector validation defect (R11-3): tool exited non-zero on non-numeric column but printed no error message to stderr"
+
+            # 12. Decimal-places option (e.g. --precision N): every requested statistic shows exactly N decimals.
+            ok_prec, err_prec = check_precision_option(tool_path, request, project_dir, csv_file)
+            if not ok_prec:
+                return False, err_prec
 
             return True, ""
         finally:
@@ -3610,6 +3791,11 @@ class OracleRegistry:
                         return False, f"Full combination row order check failed: {err_full_ord}"
                 except Exception as je:
                     return False, f"Full combination output is not valid JSON ({je})"
+
+            # Top-N option (e.g. --top N): exactly the N files with the most words (f1=9, f3=6, f2=2 words).
+            ok_top, err_top = check_top_n_option(tool_path, request, project_dir, [f2, f1, f3], {"f1": 9, "f3": 6, "f2": 2})
+            if not ok_top:
+                return False, err_top
 
             return True, ""
         finally:

@@ -166,6 +166,7 @@ class ChangeRoutingTests(unittest.TestCase):
                 self.assertFalse((d / "test_colledger.py").exists(), "old tests set aside")
                 (d / "colledger.py").write_text("import argparse\np = argparse.ArgumentParser()\np.add_argument('--json')\n"
                                                 "p.add_argument('--precision')\np.parse_args()\n", encoding="utf-8")
+                (d / "test_colledger.py").write_text("res = self.run_tool('a.csv', '--precision', '3')\n", encoding="utf-8")
                 return True, "PASSED", {"status": "success"}
 
             ok, msg, _ = sb.update_standalone_project(None, "colledger", "Add a --precision N option", build_fn=fake_build)
@@ -188,6 +189,43 @@ class ChangeRoutingTests(unittest.TestCase):
             self.assertIn("NOT done", msg)
         finally:
             sb.WORKSPACE_DIR = orig
+
+
+class VerifiedOptionTests(unittest.TestCase):
+    REQ = ("Build me a command-line tool called `colledger`. Give it a CSV file with a header row and it prints, for "
+           "each numeric column, the count, minimum, maximum and mean. It needs a `--json` option.")
+    CODE = ("class T(ToolTestCase):\n"
+            "    def test_json(self):\n        r = self.run_tool('a.csv', '--json')\n"
+            "    def test_precision(self):\n        r = self.run_tool('a.csv', '--precision', '3')\n")
+
+    def test_only_verified_options_may_be_skipped_or_corrected(self):
+        self.assertTrue(quality.tests_only_use_verified_flags(self.CODE, ["test_json"], self.REQ))
+        self.assertFalse(quality.tests_only_use_verified_flags(self.CODE, ["test_precision"], self.REQ))
+        self.assertFalse(quality.tests_only_use_verified_flags(self.CODE, ["test_json", "test_precision"], self.REQ))
+
+    def test_update_with_no_test_for_new_option_is_unverified(self):
+        td = Path(tempfile.mkdtemp())
+        orig = sb.WORKSPACE_DIR
+        try:
+            sb.WORKSPACE_DIR = td
+            d = td / "colledger"
+            (d / ".build_log").mkdir(parents=True)
+            src = "import argparse\np = argparse.ArgumentParser()\np.add_argument('--json')\np.parse_args()\n"
+            (d / "colledger.py").write_text(src, encoding="utf-8")
+
+            def build(engine, request, **kw):
+                (d / "colledger.py").write_text(src.replace("p.parse_args()", "p.add_argument('--precision')\np.parse_args()"),
+                                                encoding="utf-8")
+                (d / "test_colledger.py").write_text("res = self.run_tool('a.csv', '--json')\n", encoding="utf-8")
+                return True, "PASSED", {"status": "success"}
+
+            ok, msg, _ = sb.update_standalone_project(None, "colledger", "Add a --precision N option", build_fn=build)
+            self.assertFalse(ok)
+            self.assertIn("NOT confirmed", msg)
+            self.assertEqual((d / "colledger.py").read_text(encoding="utf-8"), src)
+        finally:
+            sb.WORKSPACE_DIR = orig
+            shutil.rmtree(td, ignore_errors=True)
 
 
 class VerifiedRepairTests(unittest.TestCase):
@@ -299,6 +337,61 @@ class PluginUpdateRollbackTests(unittest.TestCase):
             self.assertIn("1.0.1", (quar / "echo_probe.py").read_text(encoding="utf-8"), "failed candidate quarantined")
         finally:
             shutil.rmtree(td, ignore_errors=True)
+
+
+class PluginUpdateRoutingTests(unittest.TestCase):
+    """Live bug: a plugin update was left to the chat model, which ran 10 rounds and never called create_plugin."""
+
+    def test_plugin_update_uses_staged_builder_with_fixed_name(self):
+        from unittest.mock import MagicMock, patch
+        from ogun_core import engine as eng_mod
+        from ogun_core import plugin_builder
+        engine = eng_mod.CoreEngine.__new__(eng_mod.CoreEngine)
+        engine.messages = []
+        engine.last_turn_status = {}
+        engine.plugin_manager = MagicMock()
+        seen = {}
+
+        def fake_builder(eng, pm, request, max_attempts=3, force_name=None):
+            seen["force_name"] = force_name
+            seen["request"] = request
+            seen["active_inside"] = getattr(eng, "_plugin_build_active", False)
+            return True, "[PASS] Plugin 'file_crc32_checksum' successfully built, tested, and mounted on attempt 1.", force_name
+
+        with patch.object(sb, "detect_change_target", return_value=("plugin", "file_crc32_checksum")), \
+                patch.object(plugin_builder, "build_plugin_staged", side_effect=fake_builder):
+            reply = engine.run_turn("Update the file_crc32_checksum plugin so it also returns the file size")
+        self.assertEqual(seen["force_name"], "file_crc32_checksum")
+        self.assertIn("REQUESTED CHANGE", seen["request"])
+        self.assertTrue(seen["active_inside"], "routing is disabled while the builder runs")
+        self.assertFalse(getattr(engine, "_plugin_build_active", False))
+        self.assertIn("[PASS]", reply)
+
+
+class FixtureCleanupTests(unittest.TestCase):
+    def test_build_deletes_the_memory_fixture_afterwards(self):
+        td = Path(tempfile.mkdtemp())
+        orig_ws, orig_impl = sb.WORKSPACE_DIR, sb._build_standalone_project_staged_impl
+        try:
+            sb.WORKSPACE_DIR = td
+
+            def fake_impl(engine, request_text, **kw):
+                fx = td / "fixturetool" / ".build_log" / "_memory_fixture"
+                fx.mkdir(parents=True)
+                (fx / "big.csv").write_bytes(b"x" * 1024)
+                return True, "PASSED", {}
+
+            sb._build_standalone_project_staged_impl = fake_impl
+            ok, _, _ = sb.build_standalone_project_staged(None, "Build me a command-line tool called `fixturetool`.")
+            self.assertTrue(ok)
+            self.assertFalse((td / "fixturetool" / ".build_log" / "_memory_fixture").exists())
+        finally:
+            sb.WORKSPACE_DIR, sb._build_standalone_project_staged_impl = orig_ws, orig_impl
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_stderr_error_messages_are_not_weakened(self):
+        code = "self.assertIn('Column not found: zz', res.stderr)\n"
+        self.assertIn("Column not found: zz", quality.sanitize_test_code(code, "colledger"))
 
 
 if __name__ == "__main__":

@@ -51,6 +51,7 @@ def main() -> int:
         ("Ogun Dev-Ability Fixes Suite", tests_dir / "test_dev_fixes.py"),
         ("Ogun Speed Optimizations Suite", tests_dir / "test_speed_optimizations.py"),
         ("Ogun Build & Upgrade Fixes Suite", tests_dir / "test_build_upgrade_fixes.py"),
+        ("Ogun Option Behaviour Checks Suite", tests_dir / "test_option_checks.py"),
     ]
 
     print("=" * 70)

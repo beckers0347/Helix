@@ -556,12 +556,13 @@ def test_resident_ollama_model_does_not_shrink_the_machine():
     model = {m.tag: m for m in hardware.catalogue()}["qwen2.5-coder:14b"]
     seen_while_loaded = _nvidia_pc(free=1.9)                       # driver view: other apps + our own 4.5 GB model
     naive = hardware.auto_configure(seen_while_loaded, model=model)
-    assert naive.gpu_units == 0 and naive.mode == "cpu"            # what the bug produced
+    assert naive.gpu_units <= 8                                    # what the bug produced: almost nothing on the GPU
     fixed_hw = hardware.adjust_for_resident_models(seen_while_loaded, resident_vram_gb=4.47, resident_ram_gb=5.6)
     assert fixed_hw.gpu.vram_free_gb == 6.37 and fixed_hw.ram_available_gb == 45.6
     assert any("held by models Ollama" in n for n in fixed_hw.notes)
     fixed = hardware.auto_configure(fixed_hw, model=model)
     assert fixed.gpu_units > 10 and fixed.mode == "hybrid", fixed
+    assert fixed.gpu_units >= naive.gpu_units + 15, (naive.gpu_units, fixed.gpu_units)
     # never beyond the card / the machine
     capped = hardware.adjust_for_resident_models(_nvidia_pc(total=12.0, free=11.0, ram_avail=63.0), 5.0, 9.0)
     assert capped.gpu.vram_free_gb == 12.0 and capped.ram_available_gb == 64.0
