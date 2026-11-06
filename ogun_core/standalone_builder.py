@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 from ogun_core.codetools import run_python_test
@@ -994,12 +995,104 @@ def format_observed_behavior(project_name: str, observed_samples: List[Dict[str,
 
 
 
-def build_tool_generation_prompt(request_text: str, project_name: str, flags: Any) -> str:
-    """R12-I: tool-generation prompt containing ONLY the guidance relevant to this request.
+STATIC_BUILDER_SYSTEM_PREFIX = (
+    "You are Ogun, an expert Python software engineer building and verifying standalone CLI utilities.\n"
+    "CORE ENGINEERING CONTRACT (STATIC PREFIX):\n"
+    "- Use Python standard library modules only (no third-party packages). Import ONLY the modules your file actually uses; NEVER import unittest or define TestCase classes inside the CLI tool file.\n"
+    "- Stream the input (iterate rows/lines); never read whole large files into memory. Peak memory must stay under 150 MB on a 50 MB input.\n"
+    "- At the start of main(): `if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')`. Print JSON with `json.dumps(..., indent=2, ensure_ascii=False)`.\n"
+    "- Missing/unreadable input: print a clear message to stderr and exit 1. No tracebacks for user errors. `--help` exits 0. Default mode (no options) must succeed on any valid input.\n"
+    "- Every option must work alone and combined with every other option (e.g. a filter/selector option must also apply in --json mode).\n"
+)
 
-    The earlier prompt prepended the whole agent persona (tool-calling instructions,
-    dupefinder hints) and every rule ever added (JSON sentinel lookups, --max-width truncation,
-    two-pass re-open streaming), which confused the model on simple CSV-stats requests."""
+
+def strip_embedded_tests_from_tool(code: str) -> str:
+    """Remove any trailing unittest.TestCase class or unittest.main() accidentally appended to a CLI tool file."""
+    if not code or ("unittest" not in code and "class Test" not in code):
+        return code
+    lines = code.splitlines()
+    out = []
+    seen_main_call = False
+    skip_block = False
+    for line in lines:
+        s = line.strip()
+        if s in ("import unittest", "from unittest import TestCase"):
+            continue
+        if s.startswith("class Test") and ("TestCase" in s or "unittest" in s):
+            skip_block = True
+            continue
+        if skip_block:
+            if line and not line[0].isspace() and not s.startswith("if __name__"):
+                skip_block = False
+            else:
+                continue
+        if "unittest.main(" in s:
+            if out and out[-1].strip().startswith("if __name__"):
+                out.pop()
+            continue
+        out.append(line)
+    return "\n".join(out).rstrip() + "\n"
+
+
+def select_optimal_builder_model(host: str, preferred_model: str) -> Tuple[str, Dict[str, Any]]:
+    """Prepare the GPU for a build: unload other models (e.g. vision models), then re-pick the GPU layer count for the
+    memory that is free right now. The layers reach every call through llm_options(), so no per-build options are
+    returned, and the model is never swapped (a smaller model's build quality is unmeasured; the swap also used to
+    stick for the rest of the chat session)."""
+    base = (host or "http://127.0.0.1:11434").rstrip("/")
+    evict_other_loaded_models(base, preferred_model)
+    try:
+        from ogun_core import autotune
+        note = autotune.refresh(base, preferred_model, force=True)
+        if note:
+            print(f"[Builder] {note}")
+    except Exception:
+        pass
+    return preferred_model, {}
+
+
+def evict_other_loaded_models(host: str, active_model: str) -> List[str]:
+    """Unload any non-active models (e.g. llava, llama3.2-vision) currently resident in Ollama VRAM."""
+    import urllib.request
+    evicted: List[str] = []
+    base = (host or "http://127.0.0.1:11434").rstrip("/")
+    try:
+        req = urllib.request.Request(f"{base}/api/ps", method="GET")
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for m in data.get("models", []) or []:
+            name = m.get("name", "")
+            if name and name != active_model:
+                payload = json.dumps({"model": name, "prompt": "", "keep_alive": 0, "stream": False}).encode("utf-8")
+                ureq = urllib.request.Request(
+                    f"{base}/api/generate",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(ureq, timeout=3.0) as uresp:
+                        uresp.read()
+                    evicted.append(name)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return evicted
+
+
+def _chat_with_options(client: Any, messages: List[Dict[str, Any]], options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Invoke client.chat with options (such as num_predict caps), falling back cleanly for simple test mocks."""
+    if options:
+        try:
+            return client.chat(messages, tools=None, options=options)
+        except TypeError:
+            return client.chat(messages, tools=None)
+    return client.chat(messages, tools=None)
+
+
+def build_tool_generation_prompt(request_text: str, project_name: str, flags: Any) -> str:
+    """R12-I + Prefix Caching: tool-generation prompt with static contract first and dynamic request last."""
     req = request_text.lower()
     flags = sorted(flags) if flags else []
     kind = infer_tool_input_kind(request_text, {}, "", project_name)
@@ -1011,26 +1104,17 @@ def build_tool_generation_prompt(request_text: str, project_name: str, flags: An
     has_selector = "--column" in req or "--field" in req or "--key" in req
 
     parts = [
-        f"You are an expert Python engineer. Write a clean, robust, standalone command-line utility `{project_name}.py` "
-        f"for this request:\n\"\"\"{request_text}\"\"\"\n",
+        STATIC_BUILDER_SYSTEM_PREFIX,
         "REQUIREMENTS:",
         f"- Use argparse with exactly these options: {', '.join(flags) if flags else 'the options named in the request'} "
         "(plus -h/--help and the positional input). Do not add other options.",
-        "- Every option must work alone and combined with every other option (e.g. a filter/selector option must "
-        "also apply in --json mode).",
-        "- Missing/unreadable input: print a clear message to stderr and exit 1. No tracebacks for user errors. "
-        "`--help` exits 0. Default mode (no options) must succeed on any valid input.",
-        "- At the start of main(): `if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')`. "
-        "Print JSON with `json.dumps(..., indent=2, ensure_ascii=False)`.",
-        "- Stream the input (iterate rows/lines); never read whole large files into memory. Peak memory must stay "
-        "under 150 MB on a 50 MB input.",
     ]
     if is_csv and is_stats:
         parts += [
             "",
             "CSV STATISTICS (this request):",
-            "- Read with csv.reader(f, delimiter=args.delimiter) after opening with newline='' and encoding='utf-8'. "
-            "The first row is the header.",
+            "- Open the file with `with open(args.input, newline='', encoding='utf-8') as f:` and read with `reader = csv.reader(f, delimiter=args.delimiter)`. "
+            "CRITICAL: Keep the ENTIRE `for row in reader:` loop INSIDE the `with open(...) as f:` block so the file is NEVER closed before iterating rows! The first row is `header = next(reader, None)`.", 
             "- Make ONE pass over the rows and keep, per column, running accumulators only: count, min, max, sum, and "
             "a flag `non_numeric_seen`. Do NOT store the values in lists.",
             "- For each cell: strip it; skip it if empty; try `float(cell)` (accepts negatives/decimals/exponents); on "
@@ -1052,9 +1136,10 @@ def build_tool_generation_prompt(request_text: str, project_name: str, flags: An
             "",
             "TABLE OUTPUT:",
             "- Build every row as a list of already-formatted strings first (header row, data rows, and a total row if any).",
-            "- widths has exactly ONE entry per column: widths[i] = max(len(row[i]) for every row including the header).",
-            "- Print: header = ' | '.join(c.ljust(w) for c, w in zip(header, widths)); separator = '-+-'.join('-' * w for w in widths); "
-            "each data row joined the same way as the header.",
+            "- widths has exactly ONE entry per column: `widths = [max(len(str(r[i])) for r in [header] + rows) for i in range(len(header))]`.",
+            "- Print header: `print(' | '.join(str(c).ljust(w) for c, w in zip(header, widths)))`.",
+            "- Print separator: `print('-+-'.join('-' * w for w in widths))`.",
+            "- Print EVERY row in `rows` with exact width padding: `for row in rows: print(' | '.join(str(c).ljust(w) for c, w in zip(row, widths)))`. NEVER print a row without `.ljust(w)` padding!",
             "- Never call max()/min() on a possibly empty sequence (e.g. no numeric columns): print just the header "
             "and separator in that case.",
         ]
@@ -1074,9 +1159,156 @@ def build_tool_generation_prompt(request_text: str, project_name: str, flags: An
         ]
     parts += [
         "",
+        f"Write a clean, robust, standalone command-line utility `{project_name}.py` for this request:\n\"\"\"{request_text}\"\"\"",
+        "",
         f"Output ONLY the complete code for `{project_name}.py` in a single ```python block starting with `# FILE: {project_name}.py`. No explanations.",
     ]
     return "\n".join(parts)
+
+
+_REQUEST_IN_PROMPT_RES = (
+    re.compile(r'for this request:\s*"""(.*?)"""', re.S),
+    re.compile(r'USER REQUEST FOR `[^`]+`:\s*"""(.*?)"""', re.S),
+)
+_CHANGE_VERB_RE = re.compile(
+    r"\b(update|upgrade|improve|enhance|modify|change|edit|extend|fix|add|rework|refactor|rewrite|make)\b", re.I)
+
+
+def load_original_request(project_dir: Path) -> str:
+    """The request a workspace tool was built from: .build_log/request.txt, or (tools built before that file existed)
+    the request quoted in the first saved tool prompt. Empty string when unknown."""
+    log = Path(project_dir) / ".build_log"
+    try:
+        saved = (log / "request.txt").read_text(encoding="utf-8").strip()
+        if saved:
+            return saved
+    except Exception:
+        pass
+    for prompt in sorted(log.glob("attempt_*/tool_prompt.txt")):
+        try:
+            text = prompt.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for rx in _REQUEST_IN_PROMPT_RES:
+            m = rx.search(text)
+            if m:
+                return m.group(1).strip()
+    return ""
+
+
+def _name_variants(name: str):
+    words = re.split(r"[_\-\s]+", name.lower())
+    return {name.lower(), " ".join(words), "-".join(words), "".join(words)}
+
+
+def detect_change_target(user_text: str, workspace_dir: Optional[Path] = None,
+                         plugins_dir: Optional[Path] = None) -> Optional[Tuple[str, str]]:
+    """If the request asks to CHANGE something Ogun already has, return ("workspace_tool", name) for
+    workspace/<name>/<name>.py or ("plugin", name) for plugins/custom_tools/<name>.py; otherwise None.
+
+    Live bugs: an update request for a workspace tool ran a chat turn that only edited the tests and then reported
+    "tests passed" although the requested option did not exist; a plugin update timed out without changing anything.
+    """
+    text = (user_text or "").strip()
+    if not text or not _CHANGE_VERB_RE.search(text):
+        return None
+    low = re.sub(r"\s+", " ", text.lower())
+    if re.search(r"\b(build|create|write|make)\s+(me\s+)?(a|an)\s+(new\s+)?(command-line\s+|cli\s+)?(tool|plugin|script)\b", low):
+        return None
+    from ogun_core.paths import CUSTOM_TOOLS_DIR
+    workspace_dir = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    plugins_dir = Path(plugins_dir) if plugins_dir else CUSTOM_TOOLS_DIR
+
+    def mentioned(name: str) -> bool:
+        return any(re.search(r"(?<![\w-])" + re.escape(v) + r"(?![\w-])", low) for v in _name_variants(name))
+
+    hits: List[Tuple[str, str]] = []
+    if workspace_dir.is_dir():
+        for d in workspace_dir.iterdir():
+            if d.is_dir() and (d / f"{d.name}.py").exists() and mentioned(d.name):
+                hits.append(("workspace_tool", d.name))
+    if plugins_dir.is_dir():
+        for f in plugins_dir.glob("*.py"):
+            if f.stem != "__init__" and mentioned(f.stem):
+                hits.append(("plugin", f.stem))
+    if not hits:
+        return None
+    if len({k for k, _ in hits}) > 1:
+        want = "plugin" if re.search(r"\bplugin\b", low) else "workspace_tool"
+        hits = [h for h in hits if h[0] == want] or hits
+    return max(hits, key=lambda h: len(h[1]))
+
+
+def help_lists_options(tool_path: Path, flags: List[str], timeout: float = 20.0) -> List[str]:
+    """Run `<tool> --help`; return the requested flags NOT listed (a real check, not a text search of the source)."""
+    try:
+        proc = subprocess.run([sys.executable, str(tool_path), "--help"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout,
+                              env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+        out = (proc.stdout or "") + (proc.stderr or "")
+    except Exception:
+        out = ""
+    return [f for f in flags if f not in out]
+
+
+def _restore_pre_update(project_dir: Path, project_name: str, backup_dir: Optional[Path]) -> str:
+    """Put the tool and its tests back exactly as they were before a failed update (a failed update must never leave
+    the user with a changed tool or no test file). Returns a short note."""
+    if not backup_dir or not backup_dir.is_dir():
+        return ""
+    restored = []
+    for fname in (f"{project_name}.py", f"test_{project_name}.py"):
+        src = backup_dir / fname
+        if src.exists():
+            shutil.copy2(src, project_dir / fname)
+            restored.append(fname)
+    return f"Restored the previous {' and '.join(restored)} (backup kept in {backup_dir.name})." if restored else ""
+
+
+def update_standalone_project(
+    engine: Any,
+    project_name: str,
+    change_request: str,
+    max_attempts: int = 5,
+    on_progress: Optional[Callable[[str, int], None]] = None,
+    build_fn: Optional[Callable[..., Tuple[bool, str, Dict[str, Any]]]] = None,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """Change an existing workspace tool through the same verified build loop as a new build.
+
+    The original request plus the change becomes the build request, so every old option is re-verified along with the
+    new one. The existing tool is the starting point; the old test file is set aside so fresh tests cover the change.
+    Success is only reported when `--help` really lists every option the change asked for.
+    """
+    from ogun_core.quality import extract_requested_flags
+    project_dir = WORKSPACE_DIR / project_name
+    tool_path = project_dir / f"{project_name}.py"
+    if not tool_path.exists():
+        msg = f"Update failed: workspace/{project_name}/{project_name}.py does not exist."
+        return False, msg, {"status": "failed", "error": msg}
+    original = load_original_request(project_dir) or (
+        f"Build me a command-line tool called `{project_name}`. Keep all of its current behaviour and options exactly as they are now.")
+    combined = (f"{original}\n\nUPDATE REQUESTED BY THE USER (apply it and keep every existing option and behaviour "
+                f"working): {change_request.strip()}")
+    test_path = project_dir / f"test_{project_name}.py"
+    backup_dir = project_dir / ".build_log" / f"pre_update_{time.strftime('%Y%m%d-%H%M%S')}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(tool_path, backup_dir / tool_path.name)
+    if test_path.exists():
+        shutil.move(str(test_path), str(backup_dir / test_path.name))
+    success, msg, details = (build_fn or build_standalone_project_staged)(engine, combined, max_attempts=max_attempts,
+                                                                          on_progress=on_progress)
+    new_flags = sorted(set(extract_requested_flags(change_request)) - set(extract_requested_flags(original)))
+    missing = help_lists_options(tool_path, new_flags) if new_flags and tool_path.exists() else []
+    if missing:
+        note = f"Update of `{project_name}` NOT done: {', '.join(missing)} is not an option of the tool (checked with --help)."
+        details = dict(details or {})
+        details.update(status="failed", error=note)
+        success, msg = False, f"{note}\n\n{msg}"
+    if not success:
+        restored = _restore_pre_update(project_dir, project_name, backup_dir)
+        if restored:
+            msg = f"{restored}\n\n{msg}"
+    return success, msg, details
 
 
 def build_standalone_project_staged(
@@ -1097,6 +1329,10 @@ def build_standalone_project_staged(
     build_log_dir = project_dir / ".build_log"
     build_log_dir.mkdir(parents=True, exist_ok=True)
     best_dir = build_log_dir / "best_so_far"
+    try:
+        (build_log_dir / "request.txt").write_text(request_text, encoding="utf-8")   # lets a later update rebuild from it
+    except Exception:
+        pass
 
     tool_path = project_dir / f"{project_name}.py"
     test_path = project_dir / f"test_{project_name}.py"
@@ -1121,6 +1357,17 @@ def build_standalone_project_staged(
             test_code = test_path.read_text(encoding="utf-8")
         except Exception:
             pass
+
+    client_obj = getattr(engine, "client", None)
+    runtime_model_opts: Dict[str, Any] = {}
+    if client_obj is not None and type(client_obj).__module__ != "unittest.mock" and not hasattr(client_obj, "responses") and not hasattr(client_obj, "call_history"):
+        eff_host = getattr(client_obj, "host", "http://127.0.0.1:11434")
+        eff_model = getattr(client_obj, "model", "qwen2.5-coder:14b")
+        chosen_model, runtime_model_opts = select_optimal_builder_model(eff_host, eff_model)
+        if hasattr(client_obj, "model"):
+            client_obj.model = chosen_model
+        if hasattr(client_obj, "_real") and hasattr(client_obj._real, "model"):
+            client_obj._real.model = chosen_model
 
     last_error = ""
     missing_reqs: List[str] = []
@@ -1165,11 +1412,13 @@ def build_standalone_project_staged(
             (attempt_dir / "tool_prompt.txt").write_text(prompt, encoding="utf-8")
             try:
                 _notify(f"Generating tool implementation...", 35)
-                reply = engine.client.chat([{"role": "user", "content": prompt}], tools=None)
+                reply = _chat_with_options(engine.client, [{"role": "user", "content": prompt}], options={**runtime_model_opts, "num_predict": 1400})
                 raw_content = reply.get("content", "")
                 (attempt_dir / "tool_raw.txt").write_text(raw_content, encoding="utf-8")
                 blocks = parse_code_blocks(raw_content)
                 new_tool, new_test = assign_code_blocks(blocks, project_name)
+                if new_tool:
+                    new_tool = strip_embedded_tests_from_tool(new_tool)
 
                 if new_tool:
                     try:
@@ -1324,17 +1573,13 @@ def build_standalone_project_staged(
 
         # Stage 3: Generate tests grounded in observed behavior
         if tool_code and not test_code:
-            kind = infer_tool_input_kind(request_text, contract, tool_code, project_name)
+            kind = infer_tool_input_kind(request_text, contract, '', project_name)
             fix_info = fixtures_for(kind)
             fixtures_guide = fix_info.get("prompt_fixtures_summary", "")
 
             prompt = (
-                f"You are Ogun, an expert software engineer.\n"
-                f"Write comprehensive unit tests in `test_{project_name}.py` verifying `{project_name}.py` against this user request:\n"
-                f"\"\"\"{request_text}\"\"\"\n\n"
-                f"Here is the implementation of `{project_name}.py`:\n```python\n{tool_code}\n```\n\n"
-                f"OBSERVED BEHAVIOUR FROM REAL RUNTIME SMOKE EXECUTIONS:\n{observed_output}\n\n"
-                "CRITICAL TEST SCAFFOLD & CONTRACT REQUIREMENTS:\n"
+                STATIC_BUILDER_SYSTEM_PREFIX
+                + "CRITICAL TEST SCAFFOLD & CONTRACT REQUIREMENTS:\n"
                 "1. TEST SCAFFOLD IMPORT: Import `ToolTestCase` from `_scaffold`. Your test class MUST inherit from `ToolTestCase`:\n"
                 "   ```python\n"
                 "   from _scaffold import ToolTestCase\n"
@@ -1366,12 +1611,16 @@ def build_standalone_project_staged(
                 "   if __name__ == '__main__':\n"
                 "       unittest.main()\n"
                 "   ```\n"
-                f"9. Output ONLY the complete Python test code for `test_{project_name}.py` inside a single ```python ``` code block. Do NOT include `# FILE:` headers, conversational text, or duplicated code blocks."
+                f"9. Output ONLY the complete Python test code for `test_{project_name}.py` inside a single ```python ``` code block. Do NOT include `# FILE:` headers, conversational text, or duplicated code blocks.\n\n"
+                f"Write comprehensive unit tests in `test_{project_name}.py` verifying `{project_name}.py` against this user request:\n"
+                f"\"\"\"{request_text}\"\"\"\n\n"
+                f"Here is the implementation of `{project_name}.py`:\n```python\n{tool_code}\n```\n\n"
+                f"OBSERVED BEHAVIOUR FROM REAL RUNTIME SMOKE EXECUTIONS:\n{observed_output}"
             )
             (attempt_dir / "tests_prompt.txt").write_text(prompt, encoding="utf-8")
             try:
                 _notify("Generating comprehensive tests grounded in observed behavior...", 70)
-                reply = engine.client.chat([{"role": "user", "content": prompt}], tools=None)
+                reply = _chat_with_options(engine.client, [{"role": "user", "content": prompt}], options={**runtime_model_opts, "num_predict": 1500})
                 raw_content = reply.get("content", "")
                 (attempt_dir / "tests_raw.txt").write_text(raw_content, encoding="utf-8")
                 blocks = parse_code_blocks(raw_content)
@@ -1398,7 +1647,7 @@ def build_standalone_project_staged(
                             + "Output ONLY the complete Python code in a single ```python ``` block."
                         )
                         try:
-                            rw_reply = engine.client.chat([{"role": "user", "content": rw_prompt}], tools=None)
+                            rw_reply = _chat_with_options(engine.client, [{"role": "user", "content": rw_prompt}], options={**runtime_model_opts, "num_predict": 1200})
                             rw_raw = rw_reply.get("content", "")
                             (attempt_dir / "tests_rewrite_raw.txt").write_text(rw_raw, encoding="utf-8")
                             rw_blocks = parse_code_blocks(rw_raw)
@@ -1416,8 +1665,13 @@ def build_standalone_project_staged(
                             writes_log[f"test_{project_name}.py"] = {
                                 "written": False, "sha256_before": "", "sha256_after": "", "status": f"rejected: TESTS INVALID ({'; '.join(val_issues_2)})"
                             }
-                            last_error = f"TESTS INVALID ({'; '.join(val_issues_2)})"
-                            return (
+                            _tests_invalid = f"TESTS INVALID ({'; '.join(val_issues_2)})"
+                            # Returning here on the FIRST attempt ended an update after one try with the requested
+                            # option never added. Only the last attempt ends the build; otherwise the fix stage runs
+                            # (keeping coverage/smoke failures) and the next attempt writes the tests again.
+                            last_error = (last_error + "\n" if last_error else "") + _tests_invalid
+                            if attempt >= max_attempts:
+                              return (
                                 False,
                                 f"Tests rejected on deterministic validation:\n" + "\n".join(f"- {i}" for i in val_issues_2),
                                 {
@@ -1432,13 +1686,17 @@ def build_standalone_project_staged(
                                     "failing_tests": [],
                                     "output": f"Tests rejected on deterministic validation:\n" + "\n".join(f"- {i}" for i in val_issues_2),
                                 }
-                            )
+                              )
+                            new_test = ""          # never write tests that failed validation
                         else:
                             new_test = cleaned_test_2
                     else:
                         new_test = cleaned_test
 
-                    test_ok, test_reason = validate_test_code_regression(new_test, "", project_name)
+                    if new_test:
+                        test_ok, test_reason = validate_test_code_regression(new_test, "", project_name)
+                    else:
+                        test_ok, test_reason = False, "generated tests failed validation twice; retrying next attempt"
 
                     if test_ok:
                         sha_before = get_sha256(test_path)
@@ -1502,8 +1760,12 @@ def build_standalone_project_staged(
         elif test_code:
             _notify("Running unit tests via real interpreter...", 80)
             ensure_unittest_main_guard(test_path)
-            summary = run_and_parse_unittest(project_dir, f"test_{project_name}")
-            direct_ok, direct_out, direct_ran = run_direct_test_file(project_dir, test_path)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as _pool:
+                _f_sum = _pool.submit(run_and_parse_unittest, project_dir, f"test_{project_name}")
+                _f_dir = _pool.submit(run_direct_test_file, project_dir, test_path)
+                summary = _f_sum.result()
+                direct_ok, direct_out, direct_ran = _f_dir.result()
             test_res_str = summary.raw_output + ("\nDirect run:\n" + direct_out if not direct_ok else "")
             (attempt_dir / "test_output.txt").write_text(test_res_str, encoding="utf-8")
             failing_tests = summary.failed_test_names
@@ -1511,7 +1773,8 @@ def build_standalone_project_staged(
 
             # R11-1: Deterministic observed-output test repair (Run BEFORE strategy rotation and before quarantine)
             if not passed and failing_tests:
-                rep_ok, rep_code = repair_observed_output_test_defects(test_code, test_res_str)
+                _tool_verified = bool(smoke_ok and OracleRegistry.applicable_oracles(request_text))
+                rep_ok, rep_code = repair_observed_output_test_defects(test_code, test_res_str, tool_verified=_tool_verified)
                 if rep_ok:
                     try:
                         ast.parse(rep_code)
@@ -1665,7 +1928,7 @@ def build_standalone_project_staged(
 
         # Execute Fix Stage if attempts remain
         if attempt < max_attempts:
-            tool_kind = infer_tool_input_kind(request_text, contract, tool_code, project_name)
+            tool_kind = infer_tool_input_kind(request_text, contract, '', project_name)
             tool_fixtures_info = fixtures_for(tool_kind)
             fix_fixtures_guide = tool_fixtures_info.get("prompt_guidance", "")
 
@@ -1683,7 +1946,8 @@ def build_standalone_project_staged(
 
             if fix_stage == "regenerate_tests_only":
                 prompt = (
-                    f"The standalone tool `{project_name}.py` has passed all requirements coverage and runtime smoke tests.\n"
+                    STATIC_BUILDER_SYSTEM_PREFIX
+                    + f"The standalone tool `{project_name}.py` has passed all requirements coverage and runtime smoke tests.\n"
                     "The current unit tests have failing assertions or invalid test-side assumptions.\n\n"
                     f"USER REQUIREMENTS:\n\"\"\"{request_text}\"\"\"\n\n"
                     f"{tool_lock_note}"
@@ -1702,7 +1966,8 @@ def build_standalone_project_staged(
                 )
             elif fix_stage == "regenerate_tool_only":
                 prompt = (
-                    f"The test suite for `{project_name}.py` expresses the required behavior, but the tool failed tests or reference oracles.\n\n"
+                    STATIC_BUILDER_SYSTEM_PREFIX
+                    + f"The test suite for `{project_name}.py` expresses the required behavior, but the tool failed tests or reference oracles.\n\n"
                     f"USER REQUIREMENTS:\n\"\"\"{request_text}\"\"\"\n\n"
                     f"{unreq_note}"
                     f"CURRENT TOOL CODE (`{project_name}.py`) - fix THIS code, do not start from scratch:\n```python\n{tool_code}\n```\n\n"
@@ -1731,7 +1996,8 @@ def build_standalone_project_staged(
                 )
             elif fix_stage == "minimal_diff_targeted_fix":
                 prompt = (
-                    f"Targeted fix for a single failing test assertion in `{project_name}.py`.\n\n"
+                    STATIC_BUILDER_SYSTEM_PREFIX
+                    + f"Targeted fix for a single failing test assertion in `{project_name}.py`.\n\n"
                     f"USER REQUIREMENTS:\n\"\"\"{request_text}\"\"\"\n\n"
                     f"{tool_lock_note}"
                     f"FAILURES TO FIX:\n{last_error[:4000]}\n\n"
@@ -1744,7 +2010,8 @@ def build_standalone_project_staged(
                 )
             else:
                 prompt = (
-                    f"Unit test failure for `{project_name}.py` on attempt {attempt}:\n\n"
+                    STATIC_BUILDER_SYSTEM_PREFIX
+                    + f"Unit test failure for `{project_name}.py` on attempt {attempt}:\n\n"
                     f"USER REQUIREMENTS:\n\"\"\"{request_text}\"\"\"\n\n"
                     f"{tool_lock_note}"
                     f"FAILURES TO FIX:\n{last_error[:4000]}\n\n"
@@ -1769,14 +2036,10 @@ def build_standalone_project_staged(
                 _notify(f"Executing self-correction fix (strategy: {fix_stage})...", 88)
                 # R12-L: after an identical (no-op) candidate, the same prompt at temperature 0.1
                 # returns the same code again; retry with more sampling freedom.
+                fix_opts = {**runtime_model_opts, "num_predict": 1500}
                 if no_op_streak > 0:
-                    try:
-                        reply = engine.client.chat([{"role": "user", "content": prompt}], tools=None,
-                                                   options={"temperature": min(0.3 + 0.2 * no_op_streak, 0.9)})
-                    except TypeError:
-                        reply = engine.client.chat([{"role": "user", "content": prompt}], tools=None)
-                else:
-                    reply = engine.client.chat([{"role": "user", "content": prompt}], tools=None)
+                    fix_opts["temperature"] = min(0.3 + 0.2 * no_op_streak, 0.9)
+                reply = _chat_with_options(engine.client, [{"role": "user", "content": prompt}], options=fix_opts)
                 raw_content = reply.get("content", "")
                 (attempt_dir / "fix_raw.txt").write_text(raw_content, encoding="utf-8")
                 blocks = parse_code_blocks(raw_content)

@@ -145,6 +145,17 @@ def apply_hardware_profile(profile):
     return True
 
 
+def set_auto_num_gpu(num_gpu):
+    """Update ONLY the AUTO profile's GPU layer count (live VRAM refresh). num_ctx/threads stay as they are, because
+    changing num_ctx reloads the model. No effect unless the AUTO profile is active. Returns True when applied."""
+    if _ACTIVE.get("profile") != "AUTO":
+        return False
+    _ACTIVE["num_gpu"] = num_gpu
+    if isinstance(_ACTIVE.get("hardware"), dict):
+        _ACTIVE["hardware"]["num_gpu"] = num_gpu
+    return True
+
+
 def llm_options(**extra):
     """The Ollama `options` payload for EVERY chat/generate call, including the ACTIVE num_gpu.
 
@@ -252,6 +263,7 @@ Your response MUST contain EXACTLY TWO fenced ```python code blocks in this orde
 - Standalone runnable via `python plugins/tests/test_<name>.py` (no pytest required).
 - Add the Ogun root to `sys.path` using `Path(__file__).resolve().parents[2]`.
 - Verify execution on typical inputs, empty strings (if applicable), and edge cases.
+- Compute every expected value inside the test with real code (e.g. call the same standard-library function, such as zlib.crc32 or hashlib, on the test's own input file). NEVER hand-calculate checksums, hashes, means or other numbers as constants: a guessed constant fails a correct plugin.
 - Print "PASS" and exit with code 0 on success, or print error to stderr and exit with non-zero code on failure.
 
 ### Template Skeleton:

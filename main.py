@@ -137,6 +137,9 @@ def main() -> None:
                 result = unload_model(model=args.model)
                 print(f"\n{result['detail']} The next question reloads the model (about 40 seconds).")
                 continue
+            _gpu_note = autotune.refresh(OLLAMA_HOST, args.model)
+            if _gpu_note:
+                print(f"[Hardware] {_gpu_note}")
             reply = engine.run_turn(user_input)
             print(f"\n{reply}")
         except KeyboardInterrupt:

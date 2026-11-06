@@ -213,11 +213,14 @@ class OllamaClient:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         options: Optional[Dict[str, Any]] = None,
+        stream: bool = False,
+        on_token: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        """Send chat request to Ollama using live adaptive timeout."""
+        """Send chat request to Ollama using live adaptive timeout and optional token streaming."""
         overrides = options or {}
         options = llm_options(**overrides)
         eff_timeout = self.get_effective_timeout()
+        use_stream = bool(stream or on_token is not None)
 
         # Try official ollama package first
         try:
@@ -232,6 +235,25 @@ class OllamaClient:
             }
             if tools:
                 kwargs["tools"] = tools
+            if use_stream:
+                kwargs["stream"] = True
+                stream_resp = client.chat(**kwargs)
+                parts: List[str] = []
+                tcalls: List[Any] = []
+                for chunk in stream_resp:
+                    msg = chunk.get("message", {}) if isinstance(chunk, dict) else getattr(chunk, "message", {})
+                    piece = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+                    if piece:
+                        parts.append(piece)
+                        if on_token is not None:
+                            on_token(piece)
+                    tc = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
+                    if tc:
+                        tcalls.extend(tc)
+                return {
+                    "content": "".join(parts),
+                    "tool_calls": tcalls,
+                }
 
             resp = client.chat(**kwargs)
             msg = resp.get("message", {})
@@ -459,6 +481,44 @@ class CoreEngine:
                 f"Previous status or failure context: {prev_error}.\n"
                 "Please execute real tool calls (write_file, run_python_test) to complete and verify the implementation. "
                 "Do not output plain prose claims without executing the tools."
+            )
+
+        # A request to CHANGE an existing workspace tool or plugin updates it instead of starting something new.
+        from ogun_core.standalone_builder import detect_change_target
+        _target = None if clean_user in continuation_words else detect_change_target(effective_user_text)
+        if _target and _target[0] == "workspace_tool":
+            from ogun_core.standalone_builder import update_standalone_project
+            try:
+                success, final_msg, details = update_standalone_project(self, _target[1], effective_user_text)
+            except TimeoutError:
+                success, final_msg, details = False, "Model request timed out while updating the tool. Say 'continue' to retry.", {"status": "timeout"}
+            self.last_turn_status = {
+                "status": "success" if success else ("timeout" if details.get("status") == "timeout" else "failed"),
+                "task": user_text,
+                "error": "" if success else details.get("error", "Update failed"),
+            }
+            self.messages.append({"role": "assistant", "content": final_msg})
+            return final_msg
+        if _target and _target[0] == "plugin":
+            from ogun_core.paths import CUSTOM_TOOLS_DIR, PLUGINS_TESTS_DIR
+            _pname = _target[1]
+            try:
+                _pcode = (CUSTOM_TOOLS_DIR / f"{_pname}.py").read_text(encoding="utf-8")
+            except Exception:
+                _pcode = "(could not read the current code)"
+            try:
+                _ptest = (PLUGINS_TESTS_DIR / f"test_{_pname}.py").read_text(encoding="utf-8")
+            except Exception:
+                _ptest = "(no existing test file)"
+            effective_user_text = (
+                f"UPDATE your existing plugin `{_pname}`. Call `create_plugin` with name=\"{_pname}\" (exactly this name, so "
+                "the plugin is replaced, not duplicated), the COMPLETE updated code and the COMPLETE updated test code. "
+                "Start from the current code below, keep what works and apply only the requested change. The test must "
+                "compute expected values with real code (e.g. the same standard-library call on its own input), never "
+                "hand-calculated constants.\n\n"
+                f"=== CURRENT plugins/custom_tools/{_pname}.py ===\n{_pcode}\n"
+                f"=== CURRENT plugins/tests/test_{_pname}.py ===\n{_ptest}\n"
+                f"=== REQUESTED CHANGE ===\n{user_text}\n=== END ==="
             )
 
         # Check if standalone CLI project request

@@ -896,9 +896,22 @@ def recommend_model(hw: HardwareInfo) -> ModelSpec:
         return cat["qwen2.5-coder:7b"]
 
 
-def _estimate_kv_cache_gb(blocks: int, head_count_kv: int, head_dim: int, num_ctx: int) -> float:
-    """Calculate total FP16 KV cache memory in gigabytes: 2 * blocks * heads_kv * head_dim * 2 * ctx."""
-    bytes_per_tok = 2 * blocks * head_count_kv * head_dim * 2
+def _estimate_kv_cache_gb(
+    blocks: int,
+    head_count_kv: int,
+    head_dim: int,
+    num_ctx: int,
+    kv_cache_type: str = "fp16",
+) -> float:
+    """Calculate total KV cache memory in gigabytes for fp16 (2B), q8_0 (1B), or q4_0 (0.5B)."""
+    kt = (kv_cache_type or "fp16").strip().lower()
+    if kt in ("q4_0", "q4", "int4"):
+        bytes_per_elem = 0.5
+    elif kt in ("q8_0", "q8", "int8"):
+        bytes_per_elem = 1.0
+    else:
+        bytes_per_elem = 2.0
+    bytes_per_tok = 2 * blocks * head_count_kv * head_dim * bytes_per_elem
     return (bytes_per_tok * num_ctx) / (1024**3)
 
 
@@ -966,9 +979,13 @@ def auto_configure(
     # Enforce constraints: multiple of 1024, clamp [4096, min(16384, native_ctx)]
     num_ctx = max(4096, min(16384, min(model.native_ctx, (num_ctx // 1024) * 1024)))
 
-    # 4. Total units and KV cache calculation
+    # 4. Total units and KV cache calculation (supports quantized KV cache q8_0 / q4_0)
+    kv_cache_type = str(overrides.get("kv_cache_type") or os.environ.get("OLLAMA_KV_CACHE_TYPE") or "fp16").strip().lower()
+    if overrides.get("compact_ctx") and "ctx" not in overrides and target_ctx is None:
+        if hw.gpu and not hw.gpu.unified_memory and hw.gpu.vram_free_gb < 8.5:
+            num_ctx = 6144
     total_units = model.blocks + 1
-    kv_total_gb = _estimate_kv_cache_gb(model.blocks, model.head_count_kv, model.head_dim, num_ctx)
+    kv_total_gb = _estimate_kv_cache_gb(model.blocks, model.head_count_kv, model.head_dim, num_ctx, kv_cache_type=kv_cache_type)
 
     # 5. Layer offloading math
     force_cpu = bool(overrides.get("force_cpu"))

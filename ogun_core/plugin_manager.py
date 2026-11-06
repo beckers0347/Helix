@@ -49,6 +49,33 @@ def normalize_plugin_name(name: str) -> str:
     return name.strip().replace("-", "_")
 
 
+_UNITTEST_RUNNER = (
+    "import importlib.util, sys, unittest\n"
+    "spec = importlib.util.spec_from_file_location('plugin_test_module', sys.argv[1])\n"
+    "mod = importlib.util.module_from_spec(spec)\n"
+    "spec.loader.exec_module(mod)\n"
+    "suite = unittest.defaultTestLoader.loadTestsFromModule(mod)\n"
+    "result = unittest.TextTestRunner(verbosity=2).run(suite)\n"
+    "if result.testsRun == 0:\n"
+    "    sys.stderr.write('NO TESTS RAN: the test file defines no runnable tests.\\n')\n"
+    "    sys.exit(5)\n"
+    "sys.exit(0 if result.wasSuccessful() else 1)\n"
+)
+
+
+def plugin_test_command(test_path: Path) -> List[str]:
+    """Command that really runs a plugin's tests. A unittest-style file without `unittest.main()` runs ZERO tests as
+    a script and exits 0, which let a broken plugin pass; such files run through the unittest loader and zero tests
+    is a failure. Plain-script tests (print PASS / non-zero exit) still run as scripts, as before."""
+    try:
+        code = Path(test_path).read_text(encoding="utf-8")
+    except Exception:
+        code = ""
+    if "TestCase" in code and "__main__" not in code:
+        return [sys.executable, "-c", _UNITTEST_RUNNER, str(test_path)]
+    return [sys.executable, str(test_path)]
+
+
 class PluginManager:
     """Dynamic lifecycle manager for Ogun plugins and tools."""
 
@@ -258,7 +285,7 @@ class PluginManager:
 
         try:
             res = subprocess.run(
-                [sys.executable, str(test_path)],
+                plugin_test_command(test_path),
                 cwd=str(self.base_dir),
                 capture_output=True,
                 text=True,
@@ -406,6 +433,21 @@ class PluginManager:
         if not tools_init.exists():
             tools_init.write_text("# Ogun custom tools package\n", encoding="utf-8")
 
+        # Keep the current version of an existing plugin: a failed UPDATE must leave the working plugin in place.
+        # (Live bug: a failed update moved the working file_crc32_checksum plugin into quarantine.)
+        previous_code = tool_file.read_text(encoding="utf-8") if tool_file.exists() else None
+        previous_test = test_file.read_text(encoding="utf-8") if test_file.exists() else None
+
+        def _restore_previous() -> str:
+            if previous_code is None:
+                return ""
+            tool_file.write_text(previous_code, encoding="utf-8")
+            if previous_test is not None:
+                test_file.write_text(previous_test, encoding="utf-8")
+            elif test_file.exists():
+                test_file.unlink()
+            return f"The previous working version of '{norm_name}' was kept."
+
         # Write files
         tool_file.write_text(code, encoding="utf-8")
         test_file.write_text(test_code, encoding="utf-8")
@@ -413,23 +455,28 @@ class PluginManager:
         # 3. Run isolated unit test
         passed, test_output = self.run_plugin_test(test_file)
         if not passed:
-            # Move failed plugin to quarantine
+            # Quarantine the failed candidate; restore the previous version if this was an update
             self.quarantine_dir.mkdir(parents=True, exist_ok=True)
             quarantine_tool = self.quarantine_dir / f"{norm_name}.py"
             try:
-                shutil.move(str(tool_file), str(quarantine_tool))
+                shutil.copy2(str(tool_file), str(quarantine_tool))
+                tool_file.unlink()
                 if test_file.exists():
                     test_file.unlink()
             except Exception:
                 pass
+            kept = _restore_previous()
             return ToolResult.error(
-                f"Plugin unit tests failed. Moved to quarantine:\n{test_output}"
+                f"Plugin unit tests failed. The new code was moved to quarantine. {kept}\n{test_output}".replace(" \n", "\n")
             )
 
         # 4. Hot load plugin
         tool_instance = self.load_tool_from_file(tool_file)
         if not tool_instance:
-            return ToolResult.error("Failed to dynamically load validated tool into memory.")
+            kept = _restore_previous()
+            if previous_code is not None:
+                self.load_tool_from_file(tool_file)
+            return ToolResult.error(f"Failed to dynamically load validated tool into memory. {kept}".strip())
 
         # 5. Persist to registry
         registry = self.load_registry()
